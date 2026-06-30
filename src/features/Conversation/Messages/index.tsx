@@ -19,11 +19,12 @@ import AssistantGroupMessage from './AssistantGroup';
 import type { WorkflowExpandLevelDefault } from './AssistantGroup/components/WorkflowCollapse';
 import CompressedGroupMessage from './CompressedGroup';
 import GroupTasksMessage from './GroupTasks';
-import SupervisorMessage from './Supervisor';
 import TaskMessage from './Task';
+import TaskCallbackMessage from './TaskCallback';
 import TasksMessage from './Tasks';
 import ToolMessage from './Tool';
 import UserMessage from './User';
+import VerifyMessage from './Verify';
 
 const prefixCls = 'ant';
 
@@ -46,6 +47,7 @@ export interface MessageItemProps {
   disableEditing?: boolean;
   enableHistoryDivider?: boolean;
   endRender?: ReactNode;
+  footerRender?: ReactNode;
   id: string;
   index: number;
   inPortalThread?: boolean;
@@ -59,6 +61,7 @@ const MessageItem = memo<MessageItemProps>(
     enableHistoryDivider,
     id,
     endRender,
+    footerRender,
     disableEditing,
     inPortalThread = false,
     index,
@@ -81,6 +84,11 @@ const MessageItem = memo<MessageItemProps>(
       inPortalThread,
       topic,
     });
+    // Supervisor renders through AssistantGroupMessage, which draws footerRender
+    // itself — keep it in the injected-footer set so the outer wrapper doesn't
+    // render the same anchored footer (e.g. AgentSignalReceiptList) a second time.
+    const shouldInjectFooter =
+      role === 'assistant' || role === 'assistantGroup' || role === 'supervisor';
 
     const onContextMenu = useCallback(
       async (event: MouseEvent<HTMLDivElement>) => {
@@ -122,6 +130,7 @@ const MessageItem = memo<MessageItemProps>(
           return (
             <AssistantMessage
               disableEditing={disableEditing}
+              footerRender={footerRender}
               id={id}
               index={index}
               isLatestItem={isLatestItem}
@@ -134,6 +143,7 @@ const MessageItem = memo<MessageItemProps>(
             <AssistantGroupMessage
               defaultWorkflowExpandLevel={defaultWorkflowExpandLevel}
               disableEditing={disableEditing}
+              footerRender={footerRender}
               id={id}
               index={index}
               isLatestItem={isLatestItem}
@@ -142,9 +152,15 @@ const MessageItem = memo<MessageItemProps>(
         }
 
         case 'supervisor': {
+          // Supervisor messages render through the rich AssistantGroup component
+          // (workflow collapse / taskCompletions / signalCallbacks) — it swaps in
+          // the group's avatar + name + 主管 badge when the message is a supervisor
+          // turn. Keeps a single code path instead of a thinner duplicate.
           return (
-            <SupervisorMessage
+            <AssistantGroupMessage
+              defaultWorkflowExpandLevel={defaultWorkflowExpandLevel}
               disableEditing={disableEditing}
+              footerRender={footerRender}
               id={id}
               index={index}
               isLatestItem={isLatestItem}
@@ -181,10 +197,18 @@ const MessageItem = memo<MessageItemProps>(
         case 'tool': {
           return <ToolMessage disableEditing={disableEditing} id={id} index={index} />;
         }
+
+        case 'verify': {
+          return <VerifyMessage id={id} index={index} />;
+        }
+
+        case 'taskCallback': {
+          return <TaskCallbackMessage id={id} index={index} />;
+        }
       }
 
       return null;
-    }, [role, defaultWorkflowExpandLevel, disableEditing, id, index, isLatestItem]);
+    }, [role, defaultWorkflowExpandLevel, disableEditing, footerRender, id, index, isLatestItem]);
 
     if (!role) return;
 
@@ -199,6 +223,7 @@ const MessageItem = memo<MessageItemProps>(
           <SafeBoundary variant="alert">
             <Suspense fallback={<BubblesLoading />}>{renderContent()}</Suspense>
           </SafeBoundary>
+          {!shouldInjectFooter && footerRender}
           {endRender}
         </Flexbox>
       </>

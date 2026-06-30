@@ -6,6 +6,7 @@ import { createAgentToolsEngine, createToolsEngine, getEnabledTools } from './in
 // Mock the store and helper dependencies
 vi.mock('@/store/tool', () => ({
   getToolStoreState: () => ({
+    connectors: [],
     builtinTools: [
       {
         identifier: 'search',
@@ -59,6 +60,39 @@ vi.mock('@/store/tool', () => ({
         } as unknown as ToolManifest,
         type: 'builtin' as const,
       },
+      {
+        identifier: 'lobe-agent',
+        manifest: {
+          api: [
+            {
+              description: 'Analyze visual media',
+              name: 'analyzeVisualMedia',
+              parameters: {
+                properties: {
+                  question: { type: 'string' },
+                  refs: {
+                    items: { type: 'string' },
+                    type: 'array',
+                  },
+                  urls: {
+                    items: { type: 'string' },
+                    type: 'array',
+                  },
+                },
+                required: ['question'],
+                type: 'object',
+              },
+            },
+          ],
+          identifier: 'lobe-agent',
+          meta: {
+            title: 'Lobe Agent',
+            avatar: 'V',
+          },
+          type: 'builtin',
+        } as unknown as ToolManifest,
+        type: 'builtin' as const,
+      },
     ],
   }),
 }));
@@ -71,8 +105,8 @@ vi.mock('@/store/tool/selectors', () => ({
     getInstalledPluginById: (id: string) => mockGetInstalledPluginById(id),
     installedPluginManifestList: () => mockInstalledPluginManifestList(),
   },
-  klavisStoreSelectors: {
-    klavisAsLobeTools: () => [],
+  composioStoreSelectors: {
+    composioAsLobeTools: () => [],
   },
   lobehubSkillStoreSelectors: {
     lobehubSkillAsLobeTools: () => [],
@@ -144,7 +178,7 @@ describe('toolEngineering', () => {
       expect(result![0]).toMatchObject({
         function: {
           description: 'Search the web',
-          name: 'search____search____builtin',
+          name: 'search____search',
           parameters: {
             properties: {
               query: { description: 'Search query', type: 'string' },
@@ -215,8 +249,38 @@ describe('toolEngineering', () => {
         provider: 'openai',
       });
 
-      expect(result.enabledToolIds).toEqual(['search', 'lobe-web-browsing']);
-      expect(result.enabledToolIds).toHaveLength(2);
+      // lobe-agent is always-on (alwaysOnToolIds), so it rides along with user tools.
+      expect(result.enabledToolIds).toEqual(['search', 'lobe-web-browsing', 'lobe-agent']);
+      expect(result.enabledToolIds).toHaveLength(3);
+    });
+
+    it('should enable lobe-agent when it is injected into runtime plugin ids', () => {
+      const toolsEngine = createAgentToolsEngine({ model: 'deepseek-chat', provider: 'deepseek' }, [
+        'lobe-agent',
+      ]);
+
+      const result = toolsEngine.generateToolsDetailed({
+        model: 'deepseek-chat',
+        provider: 'deepseek',
+        toolIds: [],
+      });
+
+      expect(result.enabledToolIds).toContain('lobe-agent');
+    });
+
+    it('should enable lobe-agent by default since it is always-on', () => {
+      const toolsEngine = createAgentToolsEngine({
+        model: 'deepseek-chat',
+        provider: 'deepseek',
+      });
+
+      const result = toolsEngine.generateToolsDetailed({
+        model: 'deepseek-chat',
+        provider: 'deepseek',
+        toolIds: [],
+      });
+
+      expect(result.enabledToolIds).toContain('lobe-agent');
     });
   });
 
@@ -368,7 +432,7 @@ describe('toolEngineering', () => {
         const result = getEnabledTools(['search'], 'gpt-4', 'openai');
         expect(result).toHaveLength(1);
         expect(result[0]).toHaveProperty('type', 'function');
-        expect(result[0].function).toHaveProperty('name', 'search____search____builtin');
+        expect(result[0].function).toHaveProperty('name', 'search____search');
       });
 
       it('should use provided model and provider', () => {
