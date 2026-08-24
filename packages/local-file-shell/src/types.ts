@@ -14,6 +14,7 @@ export interface RunCommandParams {
 }
 
 export interface RunCommandResult {
+  duration_ms?: number;
   error?: string;
   /**
    * Present only after the command has exited.
@@ -22,6 +23,22 @@ export interface RunCommandResult {
    */
   exit_code?: number;
   output?: string;
+  output_files?: {
+    stderr: { path: string; size: number; truncated: boolean };
+    stdout: { path: string; size: number; truncated: boolean };
+  };
+  /**
+   * Whether this command was actually confined by the device sandbox.
+   *
+   * Reports what HAPPENED, not what was configured. The picker's chip shows the
+   * user's intent, and intent is not proof: the flag has to survive every layer
+   * between the config and the spawn, and a run that lost it on the way would
+   * otherwise look identical to a fenced one. A security guarantee nobody can
+   * observe is a guarantee nobody should trust — so an unfenced run says so.
+   *
+   * Absent on a request that never asked for a sandbox.
+   */
+  sandboxed?: boolean;
   /**
    * Session identifier. Present for background commands and foreground commands
    * that can be resumed with `getCommandOutput`.
@@ -61,6 +78,10 @@ export interface GetCommandOutputResult {
    */
   exit_code?: number;
   output: string;
+  output_files?: {
+    stderr: { path: string; size: number; truncated: boolean };
+    stdout: { path: string; size: number; truncated: boolean };
+  };
   stderr: string;
   stdout: string;
   /**

@@ -1,4 +1,5 @@
-import { Checkbox, Flexbox, Icon, stopPropagation } from '@lobehub/ui';
+import { Flexbox, Icon, stopPropagation } from '@lobehub/ui';
+import { Checkbox } from '@lobehub/ui/base-ui';
 import { Loader2, SquareArrowOutUpRight } from 'lucide-react';
 import { memo, useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
@@ -23,6 +24,12 @@ interface ComposioServerItemProps {
    */
   agentId?: string;
   /**
+   * When true, a fresh connection is bound to the agent (Agent-exclusive
+   * "Connect new tool" flow); the resulting account lands on an agent-scoped
+   * connector row. Default false keeps composio connects user-scoped.
+   */
+  agentScoped?: boolean;
+  /**
    * Identifier used for storage (e.g., 'google-calendar')
    */
   /**
@@ -35,7 +42,7 @@ interface ComposioServerItemProps {
 }
 
 const ComposioServerItem = memo<ComposioServerItemProps>(
-  ({ appSlug, identifier, label, server, agentId }) => {
+  ({ appSlug, identifier, label, server, agentId, agentScoped = false }) => {
     const { t } = useTranslation('setting');
     const [isConnecting, setIsConnecting] = useState(false);
     const [isToggling, setIsToggling] = useState(false);
@@ -207,6 +214,9 @@ const ComposioServerItem = memo<ComposioServerItemProps>(
       setIsConnecting(true);
       try {
         const newServer = await createComposioConnection({
+          // When invoked from an Agent's "Connect new tool" flow, bind the
+          // connection to that agent so the account lands on an agent-scoped row.
+          agentId: agentScoped ? effectiveAgentId : undefined,
           appSlug,
           identifier,
           label,

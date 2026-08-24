@@ -1,3 +1,5 @@
+import { randomUUID } from 'node:crypto';
+
 import type {
   TaskContext,
   TaskDetailActivity,
@@ -6,6 +8,7 @@ import type {
   TaskDetailSubtask,
   TaskDetailWorkspaceNode,
   TaskItem,
+  TaskSchedulerContext,
   TaskStatus,
   TaskTopicHandoff,
   WorkspaceData,
@@ -13,20 +16,21 @@ import type {
 import { TRPCError } from '@trpc/server';
 
 import { AgentModel } from '@/database/models/agent';
-import { BriefModel } from '@/database/models/brief';
+import { ProjectModel } from '@/database/models/project';
 import { TaskModel } from '@/database/models/task';
 import { TaskTopicModel } from '@/database/models/taskTopic';
 import { TopicModel } from '@/database/models/topic';
 import { UserModel } from '@/database/models/user';
+import { VerifyRunModel } from '@/database/models/verifyRun';
 import type { LobeChatDatabase } from '@/database/type';
 
 import { AiAgentService } from '../aiAgent';
-import { BriefService } from '../brief';
 import { extractFileIdsFromEditorData } from '../file/extractFileIdsFromEditorData';
 import { resolveAttachmentMetadata } from '../file/resolveAttachments';
 import { type SubtaskGraphPlan, TaskGraphService } from '../taskGraph';
 import { type ReviewResult, TaskReviewService } from '../taskReview';
 import { TaskRunnerService } from '../taskRunner';
+import { createTaskSchedulerModule } from '../taskScheduler';
 
 const emptyWorkspace: WorkspaceData = { nodeMap: {}, tree: [] };
 const UNTITLED_TOPIC_TITLE = 'Untitled';
@@ -49,6 +53,7 @@ export interface CreateTaskInput {
   assigneeAgentId?: string;
   assigneeUserId?: string;
   automationMode?: 'heartbeat' | 'schedule';
+  config?: Record<string, unknown>;
   // Runtime-state pockets stored on the task row (tasks.context JSONB). Used at
   // creation to record `context.origin` — the creator conversation pointer.
   context?: TaskContext;
@@ -61,9 +66,14 @@ export interface CreateTaskInput {
   name?: string;
   parentTaskId?: string;
   priority?: number;
+  projectId?: string;
   schedulePattern?: string;
   scheduleTimezone?: string;
   sortOrder?: number;
+  // Explicit visibility for the new task. When omitted, the service derives it
+  // from `parentTaskId` (if present) or `assigneeAgentId`'s visibility, and
+  // finally falls back to the schema default ('public').
+  visibility?: 'private' | 'public';
 }
 
 export interface UpdateStatusResult {
@@ -84,10 +94,9 @@ export interface RunReadySubtasksResult {
 
 export class TaskService {
   private agentModel: AgentModel;
-  private briefModel: BriefModel;
-  private briefService: BriefService;
   private db: LobeChatDatabase;
   private taskModel: TaskModel;
+  private projectModel: ProjectModel;
   private taskTopicModel: TaskTopicModel;
   private topicModel: TopicModel;
   private userId: string;
@@ -99,11 +108,10 @@ export class TaskService {
     this.userId = userId;
     this.workspaceId = workspaceId;
     this.agentModel = new AgentModel(db, userId, workspaceId);
+    this.projectModel = new ProjectModel(db, userId, workspaceId);
     this.taskModel = new TaskModel(db, userId, workspaceId);
     this.taskTopicModel = new TaskTopicModel(db, userId, workspaceId);
     this.topicModel = new TopicModel(db, userId, workspaceId);
-    this.briefModel = new BriefModel(db, userId, workspaceId);
-    this.briefService = new BriefService(db, userId, workspaceId);
   }
 
   /**
@@ -117,17 +125,106 @@ export class TaskService {
 
     const createData: CreateTaskInput & { config?: Record<string, unknown> } = { ...input };
 
+    let parentVisibility: 'private' | 'public' | undefined;
     if (createData.parentTaskId) {
       const parent = await this.resolveOrThrow(createData.parentTaskId);
       createData.parentTaskId = parent.id;
+      parentVisibility = parent.visibility;
+      if (createData.projectId && createData.projectId !== parent.projectId) {
+        throw new TRPCError({
+          code: 'BAD_REQUEST',
+          message: 'Subtask must belong to the same project as its parent',
+        });
+      }
+      createData.projectId ??= parent.projectId ?? undefined;
     }
 
-    if (input.assigneeAgentId) {
-      const snapshot = await this.agentModel.getAgentModelConfig(input.assigneeAgentId);
-      if (snapshot) createData.config = snapshot;
+    if (createData.projectId) {
+      const project = await this.projectModel.findManageableById(createData.projectId);
+      if (!project) throw new TRPCError({ code: 'NOT_FOUND', message: 'Project not found' });
+      createData.identifierPrefix ??= project.identifier;
     }
+
+    // Pull the model/provider snapshot and the agent's visibility in a single
+    // SQL — both are needed for the same `tasks.create` row, and a second
+    // round-trip would just retrace the same primary-key path.
+    let agentVisibility: 'private' | 'public' | null = null;
+    if (input.assigneeAgentId) {
+      const agentInfo = await this.agentModel.getAgentSnapshotForTaskCreate(input.assigneeAgentId);
+      if (agentInfo) {
+        if (agentInfo.snapshot) createData.config = { ...agentInfo.snapshot, ...createData.config };
+        agentVisibility = agentInfo.visibility;
+      }
+    }
+
+    // Resolve visibility precedence: explicit caller value > parent task
+    // (subtasks inherit) > assignee agent (private agent → private task) >
+    // schema default ('public').
+    if (createData.visibility === undefined) {
+      if (parentVisibility) {
+        createData.visibility = parentVisibility;
+      } else if (agentVisibility === 'private') {
+        createData.visibility = 'private';
+      }
+    }
+
+    // Invariant: a public task can never be executed by a private agent. The
+    // explicit-override branch above can produce this combination if the
+    // caller passes `visibility='public'` while picking a private agent, so
+    // we have to assert here even though the inference path can't.
+    this.assertAgentVisibilityCompat(createData.visibility, agentVisibility);
+
+    // Invariant: a subtask can never be more public than its parent.
+    // Otherwise workspace members see an orphaned child whose parent is
+    // hidden, leaking the existence of a private task. The inference path
+    // already inherits parent visibility, but the explicit-override path can
+    // produce a `Private parent + Public child` combo if the caller insists.
+    this.assertParentVisibilityCompat(createData.visibility, parentVisibility);
 
     return this.taskModel.create(createData);
+  }
+
+  /**
+   * Enforces the invariant: a subtask cannot be more public than its parent.
+   * Promotion lattice is `private ≤ public`; child visibility ≤ parent
+   * visibility. Throws `BAD_REQUEST` on violation. No constraint when there
+   * is no parent.
+   */
+  assertParentVisibilityCompat(
+    childVisibility: 'private' | 'public' | undefined,
+    parentVisibility: 'private' | 'public' | undefined,
+  ): void {
+    if (parentVisibility !== 'private') return;
+    if (childVisibility !== 'public') return;
+    throw new TRPCError({
+      code: 'BAD_REQUEST',
+      message:
+        'A subtask cannot be more public than its parent. Promote the parent task first, or make this subtask private.',
+    });
+  }
+
+  /**
+   * Enforces the invariant: a public task must never be assigned to a private
+   * agent. Throws `BAD_REQUEST` on violation. The reverse combination
+   * (private task + public agent) is allowed by design — a workspace agent
+   * may execute owner-only tasks without leaking, since task content stays
+   * scoped to the creator via `ownership()`.
+   *
+   * `agentVisibility = null` means either no assignee or the agent could not
+   * be resolved (e.g. caller cannot see it). In both cases the combo is
+   * unconstrained because no private agent is actually involved.
+   */
+  assertAgentVisibilityCompat(
+    taskVisibility: 'private' | 'public' | undefined,
+    agentVisibility: 'private' | 'public' | null,
+  ): void {
+    if (taskVisibility !== 'public') return;
+    if (agentVisibility !== 'private') return;
+    throw new TRPCError({
+      code: 'BAD_REQUEST',
+      message:
+        'A public task cannot be assigned to a private agent. Either pick a workspace agent or make the task private first.',
+    });
   }
 
   /**
@@ -307,6 +404,60 @@ export class TaskService {
       });
     }
 
+    // Heartbeat ticks are one-shot delayed messages that re-arm themselves
+    // after each run. Seed the very first message when a user starts/restarts
+    // the schedule; otherwise a fresh heartbeat task has no event capable of
+    // reaching the lifecycle re-arm path.
+    if (
+      status === 'scheduled' &&
+      task.automationMode === 'heartbeat' &&
+      task.heartbeatInterval &&
+      task.heartbeatInterval > 0 &&
+      resolved.status !== 'running' &&
+      resolved.status !== 'scheduled'
+    ) {
+      const scheduler = createTaskSchedulerModule();
+      const schedulerContext = (resolved.context as TaskContext | null)?.scheduler as
+        TaskSchedulerContext | undefined;
+      const previousTickMessageId = schedulerContext?.tickMessageId;
+      const tickToken = randomUUID();
+      let tickMessageId: string | undefined;
+
+      try {
+        // Invalidate the previous generation before publishing. This closes
+        // the race where an old QStash delivery arrives while the replacement
+        // message is being created.
+        await this.taskModel.updateContext(task.id, { scheduler: { tickToken } });
+        tickMessageId = await scheduler.scheduleNextTopic({
+          delay: task.heartbeatInterval,
+          taskId: task.id,
+          tickToken,
+          userId: this.userId,
+        });
+
+        await this.taskModel.updateContext(task.id, {
+          scheduler: {
+            consecutiveFailures: schedulerContext?.consecutiveFailures ?? 0,
+            scheduledAt: new Date().toISOString(),
+            tickMessageId,
+            tickToken,
+          },
+        });
+      } catch (error) {
+        // Never expose a scheduled status without a persisted tick. Restore
+        // the user-visible state and cancel a newly published message when
+        // persistence was the failing step.
+        if (tickMessageId) await scheduler.cancelScheduled(tickMessageId).catch(() => undefined);
+        await this.taskModel.update(task.id, { context: resolved.context });
+        await this.taskModel.updateStatus(task.id, resolved.status);
+        throw error;
+      }
+
+      if (previousTickMessageId) {
+        await scheduler.cancelScheduled(previousTickMessageId).catch(() => undefined);
+      }
+    }
+
     const unlocked: string[] = [];
     const paused: string[] = [];
     let allSubtasksDone = false;
@@ -400,9 +551,12 @@ export class TaskService {
 
   private async assertAssigneeAgentBelongsToUser(assigneeAgentId?: string | null): Promise<void> {
     if (!assigneeAgentId) return;
+    // `existsById` already applies the workspace + visibility predicate, so a
+    // cross-user private agent never resolves. NOT_FOUND (not BAD_REQUEST or
+    // FORBIDDEN) keeps every private-agent leak path returning the same code.
     const exists = await this.agentModel.existsById(assigneeAgentId);
     if (!exists) {
-      throw new TRPCError({ code: 'BAD_REQUEST', message: 'Assignee agent not found' });
+      throw new TRPCError({ code: 'NOT_FOUND', message: 'Assignee agent not found' });
     }
   }
 
@@ -433,17 +587,17 @@ export class TaskService {
       task = { ...task, error: null };
     }
 
-    const [allDescendants, dependencies, directTopics, briefs, comments, workspace] =
-      await Promise.all([
-        this.taskModel.findAllDescendants(task.id),
-        this.taskModel.getDependencies(task.id),
-        this.taskTopicModel
-          .findWithHandoff(task.id, TASK_DETAIL_DIRECT_TOPIC_LIMIT)
-          .catch(() => []),
-        this.briefModel.findByTaskId(task.id).catch(() => []),
-        this.taskModel.getComments(task.id).catch(() => []),
-        this.taskModel.getTreePinnedDocuments(task.id).catch(() => emptyWorkspace),
-      ]);
+    // Brief hidden: the task detail activity feed no longer carries
+    // brief-type activities — the UI converges on Task Run. Briefs are therefore
+    // not fetched/enriched here (see the omitted brief spread below). The brief
+    // lifecycle, model and data are untouched; revert this to bring them back.
+    const [allDescendants, dependencies, directTopics, comments, workspace] = await Promise.all([
+      this.taskModel.findAllDescendants(task.id),
+      this.taskModel.getDependencies(task.id),
+      this.taskTopicModel.findWithHandoff(task.id, TASK_DETAIL_DIRECT_TOPIC_LIMIT).catch(() => []),
+      this.taskModel.getComments(task.id).catch(() => []),
+      this.taskModel.getTreePinnedDocuments(task.id).catch(() => emptyWorkspace),
+    ]);
 
     const allDescendantIds = allDescendants.map((s) => s.id);
     const descendantTaskMap = new Map(allDescendants.map((s) => [s.id, s]));
@@ -491,16 +645,25 @@ export class TaskService {
     const fileById = new Map(allFileMetadata.map((f) => [f.id, f]));
     const taskFiles = taskFileIds.map((id) => fileById.get(id)).filter((f) => !!f);
 
-    // Build dependency map for all descendants
-    const allDescendantDeps =
+    const [allDescendantDeps, allDescendantTopics] =
       allDescendantIds.length > 0
-        ? await this.taskModel.getDependenciesByTaskIds(allDescendantIds).catch(() => [])
-        : [];
+        ? await Promise.all([
+            this.taskModel.getDependenciesByTaskIds(allDescendantIds).catch(() => []),
+            this.taskTopicModel.findRunningByTaskIds(allDescendantIds).catch(() => []),
+          ])
+        : [[], []];
+
+    // Build dependency map for all descendants
     const idToIdentifier = new Map(allDescendants.map((s) => [s.id, s.identifier]));
     const depMap = new Map<string, string>();
     for (const dep of allDescendantDeps) {
       const depId = idToIdentifier.get(dep.dependsOnId);
       if (depId) depMap.set(dep.taskId, depId);
+    }
+
+    const runningTopicByTaskId = new Map<string, (typeof allDescendantTopics)[number]>();
+    for (const topic of allDescendantTopics) {
+      if (!runningTopicByTaskId.has(topic.taskId)) runningTopicByTaskId.set(topic.taskId, topic);
     }
 
     // Build nested subtask tree
@@ -529,6 +692,7 @@ export class TaskService {
       if (!children || children.length === 0) return undefined;
       return children.map((s) => {
         const agent = s.assigneeAgentId ? subtaskAgentMap.get(s.assigneeAgentId) : undefined;
+        const runningTopic = runningTopicByTaskId.get(s.id);
         return {
           ...(agent
             ? {
@@ -547,10 +711,19 @@ export class TaskService {
           identifier: s.identifier,
           name: s.name,
           priority: s.priority,
+          ...(runningTopic?.topicId
+            ? {
+                runningTopic: {
+                  id: runningTopic.topicId,
+                  operationId: runningTopic.operationId ?? null,
+                },
+              }
+            : {}),
           ...(s.schedulePattern || s.scheduleTimezone
             ? { schedule: { pattern: s.schedulePattern, timezone: s.scheduleTimezone } }
             : {}),
           status: s.status,
+          updatedAt: s.updatedAt ? new Date(s.updatedAt).toISOString() : undefined,
         };
       });
     };
@@ -587,6 +760,7 @@ export class TaskService {
           createdAt: doc?.createdAt ? new Date(doc.createdAt).toISOString() : undefined,
           documentId: node.id,
           fileType: doc?.fileType,
+          inaccessible: doc?.inaccessible,
           size: doc?.charCount,
           sourceTaskId: doc?.sourceTaskId,
           sourceTaskIdentifier: doc?.sourceTaskIdentifier,
@@ -612,10 +786,6 @@ export class TaskService {
       const topicAgentId = t.agentId ?? t.sourceTaskAssigneeAgentId ?? task.assigneeAgentId;
       if (topicAgentId) agentIds.add(topicAgentId);
     }
-    // Briefs may have an agentId
-    for (const b of briefs) {
-      if (b.agentId) agentIds.add(b.agentId);
-    }
     // Comments have authorAgentId or authorUserId
     for (const c of comments) {
       if (c.authorAgentId) agentIds.add(c.authorAgentId);
@@ -625,12 +795,14 @@ export class TaskService {
     if (task.createdByAgentId) agentIds.add(task.createdByAgentId);
     else if (task.createdByUserId) userIds.add(task.createdByUserId);
 
-    const [authorMap, enrichedBriefs] = await Promise.all([
-      this.resolveAuthors(agentIds, userIds),
-      this.briefService
-        .enrichBriefAgentOnly(briefs)
-        .catch(() => briefs.map((b) => ({ ...b, agent: null }))),
-    ]);
+    const authorMap = await this.resolveAuthors(agentIds, userIds);
+
+    // Every run row answers "and did it pass?" on its own (with counts). Without this the
+    // activity feed lists rounds that all look alike, and the only way to learn
+    // a round's verdict is to leave for the acceptance page.
+    const verifyByOperation = await new VerifyRunModel(this.db, this.userId, this.workspaceId)
+      .findByOperations(topics.map((t) => t.operationId).filter((id): id is string => Boolean(id)))
+      .catch(() => new Map());
 
     const creatorId = task.createdByAgentId ?? task.createdByUserId;
     const createdActivity: TaskDetailActivity | null =
@@ -647,9 +819,14 @@ export class TaskService {
       ...topics.map((t) => {
         const handoff = t.handoff as TaskTopicHandoff | null;
         const topicAgentId = t.agentId ?? t.sourceTaskAssigneeAgentId ?? task.assigneeAgentId;
+        const verifyRun = t.operationId ? verifyByOperation.get(t.operationId) : undefined;
         return {
           author: topicAgentId ? authorMap.get(topicAgentId) : undefined,
           completedAt: toISO(t.completedAt),
+          cost: t.totalCost == null ? null : Number(t.totalCost),
+          // Raw last assistant message of the run, shown alongside
+          // the synthesized summary on the run card.
+          content: handoff?.content,
           id: t.topicId ?? undefined,
           operationId: t.operationId ?? null,
           runningOperation: t.metadata?.runningOperation ?? null,
@@ -661,32 +838,24 @@ export class TaskService {
           sourceTaskName: t.sourceTaskName,
           time: toISO(t.createdAt),
           title: handoff?.title || t.title || UNTITLED_TOPIC_TITLE,
+          // What opened this round. Without it the feed cannot distinguish a run
+          // the user started from one the goal loop / scheduler opened on its
+          // own — they render identically apart from `#seq`.
+          trigger: t.trigger ?? null,
+          verify: verifyRun
+            ? {
+                acceptanceId: verifyRun.acceptanceId,
+                passed: verifyRun.passed,
+                roundIndex: verifyRun.roundIndex,
+                runId: verifyRun.id,
+                status: verifyRun.status,
+                total: verifyRun.total,
+              }
+            : null,
           type: 'topic' as const,
         };
       }),
-      ...enrichedBriefs.map((b) => ({
-        actions: b.actions ?? undefined,
-        agent: b.agent,
-        agentId: b.agentId,
-        artifacts: b.artifacts ?? undefined,
-        author: b.agentId ? authorMap.get(b.agentId) : undefined,
-        briefType: b.type,
-        createdAt: toISO(b.createdAt),
-        cronJobId: b.cronJobId,
-        id: b.id,
-        priority: b.priority,
-        readAt: toISO(b.readAt),
-        resolvedAction: b.resolvedAction,
-        resolvedAt: toISO(b.resolvedAt),
-        resolvedComment: b.resolvedComment,
-        summary: b.summary,
-        taskId: b.taskId,
-        time: toISO(b.createdAt),
-        title: b.title,
-        topicId: b.topicId,
-        type: 'brief' as const,
-        userId: b.userId,
-      })),
+      // Brief activities intentionally omitted — see the fetch note above.
       ...comments.map((c) => {
         const ids = commentFileIdsMap[c.id] ?? [];
         const files = ids.map((id) => fileById.get(id)).filter((f) => !!f);
@@ -712,6 +881,7 @@ export class TaskService {
     });
 
     const taskConfig = task.config ? (task.config as Record<string, unknown>) : undefined;
+    const taskContext = task.context ? (task.context as TaskContext) : undefined;
     const scheduleConfig = (taskConfig?.schedule ?? {}) as { maxExecutions?: number | null };
 
     return {
@@ -720,6 +890,7 @@ export class TaskService {
       checkpoint: this.taskModel.getCheckpointConfig(task),
       config: taskConfig,
       createdAt: task.createdAt ? new Date(task.createdAt).toISOString() : undefined,
+      createdByUserId: task.createdByUserId,
       dependencies: dependencies.map((d) => {
         const info = depIdToInfo.get(d.dependsOnId);
         return {
@@ -737,9 +908,11 @@ export class TaskService {
           ? {
               interval: task.heartbeatInterval,
               lastAt: task.lastHeartbeatAt ? new Date(task.lastHeartbeatAt).toISOString() : null,
+              scheduledAt: taskContext?.scheduler?.scheduledAt,
               timeout: task.heartbeatTimeout,
             }
           : undefined,
+      id: task.id,
       identifier: task.identifier,
       instruction: task.instruction,
       name: task.name,
@@ -753,12 +926,15 @@ export class TaskService {
               timezone: task.scheduleTimezone,
             }
           : undefined,
+      startedAt: task.startedAt ? new Date(task.startedAt).toISOString() : undefined,
       status: task.status,
       userId: task.assigneeUserId,
       verify: this.taskModel.getVerifyConfig(task),
+      visibility: task.visibility,
       subtasks,
       activities: activities.length > 0 ? activities : undefined,
       topicCount: topics.length > 0 ? topics.length : undefined,
+      updatedAt: task.updatedAt ? new Date(task.updatedAt).toISOString() : undefined,
       workspace: workspaceFolders.length > 0 ? workspaceFolders : undefined,
       workspaceId: task.workspaceId ?? null,
     };

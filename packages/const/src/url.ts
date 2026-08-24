@@ -4,7 +4,16 @@ export const OFFICIAL_URL = 'https://app.lobehub.com';
 export const OFFICIAL_SITE = 'https://lobehub.com';
 export const OFFICIAL_DOMAIN = 'lobehub.com';
 
+export const OFFICIAL_DEVICE_GATEWAY_URL = 'https://device-gateway.lobehub.com';
+export const OFFICIAL_AGENT_GATEWAY_URL = 'https://agent-gateway.lobehub.com';
+
 export const OG_URL = '/og/og.webp?v=1';
+
+export const LobeHubPath = {
+  webapi: {
+    modelConfig: '/webapi/lobehub-model-config',
+  },
+} as const;
 
 export const GITHUB = 'https://github.com/lobehub/lobe-chat';
 export const GITHUB_ISSUES = urlJoin(GITHUB, 'issues/new/choose');
@@ -29,6 +38,8 @@ export const PRIVACY_URL = urlJoin(OFFICIAL_SITE, '/privacy');
 export const TERMS_URL = urlJoin(OFFICIAL_SITE, '/terms');
 
 export const PLUGINS_INDEX_URL = 'https://chat-plugins.lobehub.com';
+
+export const OPS_ASSETS_BASE_URL = 'https://chat-cloud.lobeobjects.space/dc/ops-assets';
 
 export const MORE_MODEL_PROVIDER_REQUEST_URL =
   'https://github.com/lobehub/lobe-chat/discussions/6157';
@@ -64,7 +75,7 @@ export const GROUP_CHAT_TOPIC_URL = (groupId: string, topicId: string) =>
 
 export const LIBRARY_URL = (id: string) => urlJoin('/resource/library', id);
 
-export const imageUrl = (filename: string) => `/images/${filename}`;
+export const imageUrl = (filename: string) => `/app-images/${filename}`;
 
 export const LOBE_URL_IMPORT_NAME = 'settings';
 
@@ -79,5 +90,11 @@ export const CHANGELOG_URL = urlJoin(OFFICIAL_SITE, 'changelog');
 export const DOWNLOAD_URL = {
   android: 'https://play.google.com/store/apps/details?id=com.lobehub.app',
   default: urlJoin(OFFICIAL_SITE, '/downloads'),
+  mobile: urlJoin(OFFICIAL_SITE, '/mobile'),
   ios: 'https://testflight.apple.com/join/2ZbjX4Qp',
 } as const;
+
+export const channelDocUrl = (platform: string) => urlJoin(USAGE_DOCUMENTS, 'channels', platform);
+
+export const discoverUrl = (type: string, identifier: string) =>
+  urlJoin(OFFICIAL_SITE, 'discover', type, identifier);

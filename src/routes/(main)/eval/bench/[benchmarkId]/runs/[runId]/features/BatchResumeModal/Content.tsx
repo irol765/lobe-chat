@@ -1,11 +1,21 @@
 'use client';
 
-import { Badge, Checkbox, Skeleton, Table, Tag, Tooltip, Typography } from 'antd';
+import { Checkbox } from '@lobehub/ui/base-ui';
+import { Badge, Skeleton, Table, Tag, Tooltip, Typography } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
+import { createStaticStyles, cssVar } from 'antd-style';
 import { type FC, memo, useCallback, useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
 import { agentEvalService } from '@/services/agentEval';
+
+const styles = createStaticStyles(({ css }) => ({
+  indexCell: css`
+    font-family: ${cssVar.fontFamilyCode};
+    font-size: ${cssVar.fontSizeSM};
+    color: ${cssVar.colorTextTertiary};
+  `,
+}));
 
 type ResumableCase = Awaited<ReturnType<typeof agentEvalService.getResumableCases>>[number];
 
@@ -92,7 +102,7 @@ const BatchResumeContent: FC<BatchResumeContentProps> = ({
             <Checkbox
               checked={selectedIds.includes(record.testCaseId)}
               disabled={!record.canResume}
-              onChange={(e) => handleToggleRow(record.testCaseId, e.target.checked)}
+              onChange={(checked) => handleToggleRow(record.testCaseId, checked)}
             />
           </Tooltip>
         ),
@@ -101,7 +111,7 @@ const BatchResumeContent: FC<BatchResumeContentProps> = ({
             checked={allSelected}
             disabled={resumableCases.length === 0}
             indeterminate={indeterminate}
-            onChange={(e) => handleToggleAll(e.target.checked)}
+            onChange={handleToggleAll}
           />
         ),
         width: 48,
@@ -109,15 +119,7 @@ const BatchResumeContent: FC<BatchResumeContentProps> = ({
       {
         key: 'index',
         render: (_: any, record: ResumableCase) => (
-          <span
-            style={{
-              color: 'var(--ant-color-text-tertiary)',
-              fontFamily: 'monospace',
-              fontSize: 12,
-            }}
-          >
-            {record.sortOrder ?? '-'}
-          </span>
+          <span className={styles.indexCell}>{record.sortOrder ?? '-'}</span>
         ),
         title: '#',
         width: 48,
