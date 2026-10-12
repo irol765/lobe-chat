@@ -1,5 +1,5 @@
-import { ActionIcon, Flexbox, Icon } from '@lobehub/ui';
-import { Button } from '@lobehub/ui/base-ui';
+import { Flexbox, Icon } from '@lobehub/ui';
+import { ActionIcon, Button } from '@lobehub/ui/base-ui';
 import { createStaticStyles } from 'antd-style';
 import fastDeepEqual from 'fast-deep-equal';
 import { LucidePlus, LucideTrash } from 'lucide-react';
@@ -159,10 +159,11 @@ const KeyValueEditor = memo<KeyValueEditorProps>(
               >
                 <Flexbox flex={1} style={{ position: 'relative' }}>
                   <FormInput
+                    aria-invalid={isDuplicate || undefined}
                     className={styles.input}
+                    data-invalid={isDuplicate || undefined}
                     disabled={disabled}
                     placeholder={keyPlaceholder || t('KeyValueEditor.keyPlaceholder')}
-                    status={isDuplicate ? 'error' : undefined}
                     value={item.key}
                     variant={'filled'}
                     onChange={(e) => handleKeyChange(item.id, e)}

@@ -5,16 +5,28 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import ResourceConfigAccessGate from './ResourceConfigAccessGate';
 
 const mocks = vi.hoisted(() => ({
+  accessResolved: true,
   canEditContent: true,
   canEditResource: false,
+  canManageResource: false,
   navigate: vi.fn(),
   toastInfo: vi.fn(),
 }));
 
-vi.mock('@lobehub/ui/base-ui', () => ({ toast: { info: mocks.toastInfo } }));
-vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
+vi.mock('@lobehub/ui/base-ui', async (importOriginal) => ({
+  ...(await importOriginal<object>()),
+  toast: { info: mocks.toastInfo },
+}));
 vi.mock('@/components/AsyncBoundary', () => ({
-  default: ({ children }: { children: ReactNode }) => children,
+  default: ({
+    children,
+    isLoading,
+    loading,
+  }: {
+    children: ReactNode;
+    isLoading: boolean;
+    loading: ReactNode;
+  }) => (isLoading ? loading : children),
 }));
 vi.mock('@/components/Skeleton/Surface', () => ({ default: () => null }));
 vi.mock('@/features/Workspace/useWorkspaceAwareNavigate', () => ({
@@ -27,16 +39,23 @@ vi.mock('./useResourceAccess', () => ({
   useResourceAccess: () => ({
     accessError: undefined,
     canEditResource: mocks.canEditResource,
-    isAccessResolved: true,
+    canManageResource: mocks.canManageResource,
+    isAccessResolved: mocks.accessResolved,
     isLoading: false,
     retryAccess: vi.fn(),
   }),
 }));
 
-const renderGate = (resourceType: 'agent' | 'agentGroup' = 'agent') =>
+const renderGate = (
+  resourceType: 'agent' | 'agentGroup' = 'agent',
+  loading?: ReactNode,
+  requiredAccess: 'edit' | 'manage' = 'edit',
+) =>
   render(
     <ResourceConfigAccessGate
+      loading={loading}
       redirectPath="/agent/agent-1"
+      requiredAccess={requiredAccess}
       resourceId="agent-1"
       resourceType={resourceType}
     >
@@ -49,6 +68,8 @@ describe('ResourceConfigAccessGate', () => {
     vi.clearAllMocks();
     mocks.canEditContent = true;
     mocks.canEditResource = false;
+    mocks.canManageResource = false;
+    mocks.accessResolved = true;
   });
 
   it('uses workspace-aware navigation when returning a chat-only collaborator to chat', async () => {
@@ -90,5 +111,23 @@ describe('ResourceConfigAccessGate', () => {
     await waitFor(() => {
       expect(mocks.toastInfo).toHaveBeenCalledWith('permission.configAccess.groupChatOnly');
     });
+  });
+
+  it('explains when Agent sharing requires creator or admin access', async () => {
+    mocks.canEditResource = true;
+
+    renderGate('agent', undefined, 'manage');
+
+    await waitFor(() => {
+      expect(mocks.toastInfo).toHaveBeenCalledWith('permission.configAccess.agentManageRestricted');
+    });
+  });
+
+  it('uses the surface-specific loading state while access is resolving', () => {
+    mocks.accessResolved = false;
+
+    const { getByText } = renderGate('agent', <div>Profile loading</div>);
+
+    expect(getByText('Profile loading')).toBeInTheDocument();
   });
 });

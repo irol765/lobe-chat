@@ -4,11 +4,13 @@ import path from 'node:path';
 import type { DesktopBootProfilePayload } from '@lobechat/electron-client-ipc';
 import type { ElectronIPCEventHandler } from '@lobechat/electron-server-ipc';
 import { ElectronIPCServer } from '@lobechat/electron-server-ipc';
+import { enableManagedProcesses, shutdownManagedProcesses } from '@lobechat/utils/managedProcess';
 import { app, ipcMain, nativeTheme, protocol } from 'electron';
 
 import { name } from '@/../../package.json';
 import { binDir, buildDir } from '@/const/dir';
 import { isDev } from '@/const/env';
+import { shellInfo } from '@/const/shell';
 import type { IControlModule } from '@/controllers';
 import AuthCtr from '@/controllers/AuthCtr';
 import RemoteServerConfigCtr from '@/controllers/RemoteServerConfigCtr';
@@ -33,6 +35,7 @@ import { refreshShellPath } from '@/utils/shellPath';
 import { BrowserManager } from './browser/BrowserManager';
 import { backendProxyProtocolManager } from './infrastructure/BackendProxyProtocolManager';
 import { BinaryManager } from './infrastructure/BinaryManager';
+import { CoreUpdateManager } from './infrastructure/coreOta/CoreUpdateManager';
 import { I18nManager } from './infrastructure/I18nManager';
 import { IoCContainer } from './infrastructure/IoCContainer';
 import { LocalFileProtocolManager } from './infrastructure/LocalFileProtocolManager';
@@ -67,6 +70,7 @@ export class App {
   staticFileServerManager: StaticFileServerManager;
   protocolManager: ProtocolManager;
   rendererUrlManager: RendererUrlManager;
+  coreUpdateManager: CoreUpdateManager;
   localFileProtocolManager: LocalFileProtocolManager;
   binaryManager: BinaryManager;
   screenCaptureManager: ScreenCaptureManager;
@@ -76,6 +80,14 @@ export class App {
    * whether app is in quiting
    */
   isQuiting: boolean = false;
+
+  /**
+   * Set while UpdaterManager is handing an installed update over to
+   * electron-updater. It closes every window first, which on Linux would
+   * otherwise trip the `window-all-closed` quit below and kill the process
+   * before `quitAndInstall()` ever runs.
+   */
+  isInstallingUpdate: boolean = false;
 
   get appStoragePath() {
     const storagePath = this.storeManager.get('storagePath');
@@ -88,6 +100,7 @@ export class App {
   }
 
   constructor() {
+    enableManagedProcesses();
     logger.info('----------------------------------------------');
     // Log system information
     logger.info(`  OS: ${os.platform()} (${os.arch()})`);
@@ -96,6 +109,8 @@ export class App {
     logger.info(`PATH: ${app.getAppPath()}`);
     logger.info(` lng: ${app.getLocale()}`);
     logger.info(` res: ${binDir}`);
+    logger.info(`core: ${shellInfo?.source} ${shellInfo?.coreDir} abi=${shellInfo?.abi}`);
+    for (const line of shellInfo?.log ?? []) logger.info(`shell: ${line}`);
     logger.info('----------------------------------------------');
     logger.info('Starting LobeHub...');
 
@@ -155,6 +170,17 @@ export class App {
     this.binaryManager = new BinaryManager(this);
     this.screenCaptureManager = new ScreenCaptureManager(this);
 
+    this.coreUpdateManager = new CoreUpdateManager(this);
+    this.coreUpdateManager.initialize();
+    app.on('web-contents-created', (_event, webContents) => {
+      webContents.on('render-process-gone', () => {
+        this.coreUpdateManager.handleRendererCrash();
+      });
+      webContents.on('will-prevent-unload', () => {
+        this.coreUpdateManager.handleUnloadPrevented();
+      });
+    });
+
     // Register built-in binary specs
     this.registerBuiltinBinarySpecs();
 
@@ -171,6 +197,8 @@ export class App {
 
     // Unified handling of before-quit event
     app.on('before-quit', this.handleBeforeQuit);
+    process.on('SIGTERM', () => app.quit());
+    process.on('SIGINT', () => app.quit());
 
     // Initialize theme mode from store
     this.initializeThemeMode();
@@ -268,12 +296,7 @@ export class App {
     // Set global application exit state and lifecycle listeners immediately.
     this.isQuiting = false;
 
-    app.on('window-all-closed', () => {
-      if (electronIs.windows() || process.platform === 'linux') {
-        logger.info(`All windows closed, quitting application (${process.platform})`);
-        app.quit();
-      }
-    });
+    app.on('window-all-closed', this.handleWindowAllClosed);
 
     app.on('activate', this.onActivate);
 
@@ -329,6 +352,7 @@ export class App {
 
     // Initialize updater manager
     await this.updaterManager.initialize();
+    this.coreUpdateManager.startScheduledChecks();
     this.screenCaptureManager.prewarmPermissionCheck();
 
     logger.info('Post-first-frame initialization completed');
@@ -437,6 +461,7 @@ export class App {
     // https://github.com/electron/electron/issues/46538#issuecomment-2808806722
     app.commandLine.appendSwitch('gtk-version', '3');
 
+    app.commandLine.appendSwitch('enable-precise-memory-info');
     app.commandLine.appendSwitch('enable-features', this.chromeFlags.join(','));
 
     logger.debug('Waiting for app to be ready');
@@ -581,8 +606,44 @@ export class App {
     });
   }
 
-  // Add before-quit handler function
-  private handleBeforeQuit = () => {
+  /**
+   * Windows and Linux quit once the last window goes away — except while an
+   * update is being installed. `UpdaterManager.installNow()` closes every
+   * window before handing over to `autoUpdater.quitAndInstall()`, so quitting
+   * here would end the process first and the downloaded package would silently
+   * never be applied. That is a Linux-only failure today: macOS does not quit
+   * on `window-all-closed`, and installNow() skips the close loop on Windows.
+   */
+  handleWindowAllClosed = () => {
+    if (this.isInstallingUpdate) {
+      logger.info('All windows closed while installing an update, keeping the process alive');
+      return;
+    }
+
+    if (electronIs.windows() || process.platform === 'linux') {
+      logger.info(`All windows closed, quitting application (${process.platform})`);
+      app.quit();
+    }
+  };
+
+  private quitReady = false;
+  private quitCleanup?: Promise<void>;
+
+  private handleBeforeQuit = (event: Electron.Event) => {
+    if (this.quitReady) return;
+    event.preventDefault();
+    this.isQuiting = true;
+    this.quitCleanup ??= shutdownManagedProcesses()
+      .catch((error) => logger.error('Process shutdown failed:', error))
+      .then(() => {
+        this.destroyOnQuit();
+        this.quitReady = true;
+        // Let the cancelled native termination return before requesting another quit.
+        setImmediate(() => app.quit());
+      });
+  };
+
+  private destroyOnQuit = () => {
     logger.info('Application is preparing to quit');
     this.isQuiting = true;
 

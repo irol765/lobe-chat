@@ -40,6 +40,10 @@ const activeTaskDescription = (s: TaskStoreState) => activeTaskDetail(s)?.descri
 
 const activeTaskAgentId = (s: TaskStoreState) => activeTaskDetail(s)?.agentId;
 
+// Human assignee (workspace member). `detail.userId` is populated from the
+// server-side `tasks.assignee_user_id` column.
+const activeTaskAssigneeUserId = (s: TaskStoreState) => activeTaskDetail(s)?.userId;
+
 // TODO: Once the frontend store switches to reading from detail.model / detail.provider returned by the backend getTaskDetail procedure
 const activeTaskModel = (s: TaskStoreState) =>
   activeTaskDetail(s)?.config?.model as string | undefined;
@@ -52,6 +56,8 @@ const activeTaskSubtasks = (s: TaskStoreState) => activeTaskDetail(s)?.subtasks 
 const activeTaskDependencies = (s: TaskStoreState) => activeTaskDetail(s)?.dependencies ?? [];
 
 const activeTaskParent = (s: TaskStoreState) => activeTaskDetail(s)?.parent;
+
+const activeTaskGoal = (s: TaskStoreState) => activeTaskDetail(s)?.goal;
 
 // Periodic execution interval (seconds); 0 or undefined means not configured
 const activeTaskPeriodicInterval = (s: TaskStoreState) =>
@@ -124,6 +130,7 @@ const topicDrawerTitle = (s: TaskStoreState) => s.activeTopicDrawerTitle;
 
 export const taskDetailSelectors = {
   activeTaskAgentId,
+  activeTaskAssigneeUserId,
   activeTaskAutomationMode,
   activeTaskCheckpoint,
   activeTaskCreatedByUserId,
@@ -139,6 +146,7 @@ export const taskDetailSelectors = {
   activeTaskInstruction,
   activeTaskInstructionRevision,
   activeTaskName,
+  activeTaskGoal,
   activeTaskParent,
   activeTaskPeriodicInterval,
   activeTaskPriority,

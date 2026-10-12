@@ -1,6 +1,6 @@
 import { type UIChatMessage } from '@lobechat/types';
 import { TraceEventType } from '@lobechat/types';
-import * as lobeUIModules from '@lobehub/ui';
+import { copyToClipboard } from '@lobehub/ui';
 import { act, renderHook } from '@testing-library/react';
 import { type Mock } from 'vitest';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -20,6 +20,11 @@ import { messageMapKey } from '@/store/chat/utils/messageMapKey';
 import { useChatStore } from '../../store';
 
 // Mock @/libs/swr mutate
+vi.mock('@lobehub/ui', async (importOriginal) => ({
+  ...(await importOriginal<object>()),
+  copyToClipboard: vi.fn(),
+}));
+
 vi.mock('@/libs/swr', async () => {
   const actual = await vi.importActual('@/libs/swr');
   return {
@@ -29,28 +34,40 @@ vi.mock('@/libs/swr', async () => {
   };
 });
 
+vi.mock('swr', async () => {
+  const actual = await vi.importActual('swr');
+  return {
+    ...(actual as any),
+    mutate: vi.fn(),
+  };
+});
+
 vi.stubGlobal(
   'fetch',
   vi.fn(() => Promise.resolve(new Response('mock'))),
 );
 
-vi.mock('zustand/traditional');
 // Mock service
-vi.mock('@/services/message', () => ({
-  messageService: {
-    getMessages: vi.fn(),
-    updateMessageError: vi.fn(),
-    removeMessage: vi.fn(() => Promise.resolve({ success: true, messages: [] })),
-    removeMessagesByAssistant: vi.fn(),
-    removeMessages: vi.fn(() => Promise.resolve({ success: true, messages: [] })),
-    createMessage: vi.fn(() => Promise.resolve({ id: 'new-message-id', messages: [] })),
-    updateMessage: vi.fn(() => Promise.resolve({ success: true, messages: [] })),
-    updateMessageMetadata: vi.fn(() => Promise.resolve({ success: true, messages: [] })),
-    updateMessagePlugin: vi.fn(() => Promise.resolve({ success: true, messages: [] })),
-    updateMessagePluginError: vi.fn(() => Promise.resolve({ success: true, messages: [] })),
-    updateMessageRAG: vi.fn(() => Promise.resolve({ success: true, messages: [] })),
-  },
-}));
+vi.mock('@/services/message', () => {
+  const getMessages = vi.fn();
+  return {
+    messageService: {
+      getMessages,
+      // The list cache reads pages; tests stub the plain list underneath.
+      getMessageListPage: vi.fn((params) => getMessages(params)),
+      updateMessageError: vi.fn(),
+      removeMessage: vi.fn(() => Promise.resolve({ success: true, messages: [] })),
+      removeMessagesByAssistant: vi.fn(),
+      removeMessages: vi.fn(() => Promise.resolve({ success: true, messages: [] })),
+      createMessage: vi.fn(() => Promise.resolve({ id: 'new-message-id', messages: [] })),
+      updateMessage: vi.fn(() => Promise.resolve({ success: true, messages: [] })),
+      updateMessageMetadata: vi.fn(() => Promise.resolve({ success: true, messages: [] })),
+      updateMessagePlugin: vi.fn(() => Promise.resolve({ success: true, messages: [] })),
+      updateMessagePluginError: vi.fn(() => Promise.resolve({ success: true, messages: [] })),
+      updateMessageRAG: vi.fn(() => Promise.resolve({ success: true, messages: [] })),
+    },
+  };
+});
 vi.mock('@/services/topic', () => ({
   topicService: {
     createTopic: vi.fn(() => Promise.resolve()),
@@ -76,6 +93,12 @@ beforeEach(() => {
   vi.clearAllMocks();
   clearMessageListClientCacheState();
   useChatStore.setState(mockState, false);
+
+  // Vitest 5 no longer resets automock state in `vi.restoreAllMocks`, so a
+  // `mockResolvedValue` set with `vi.spyOn(messageService, …)` inside a test leaks
+  // into the following ones. Re-apply the factory defaults here.
+  (messageService.updateMessage as Mock).mockResolvedValue({ success: true, messages: [] } as any);
+  (messageService.removeMessage as Mock).mockResolvedValue({ success: true, messages: [] } as any);
 });
 
 afterEach(() => {
@@ -452,13 +475,12 @@ describe('chatMessage actions', () => {
       const messageId = 'message-id';
       const content = 'Test content';
       const { result } = renderHook(() => useChatStore());
-      const copyToClipboardSpy = vi.spyOn(lobeUIModules, 'copyToClipboard');
 
       await act(async () => {
         await result.current.copyMessage(messageId, content);
       });
 
-      expect(copyToClipboardSpy).toHaveBeenCalledWith(content);
+      expect(copyToClipboard).toHaveBeenCalledWith(content);
     });
 
     it('should call internal_traceMessage with correct parameters', async () => {
@@ -749,15 +771,6 @@ describe('chatMessage actions', () => {
   });
 
   describe('refreshMessages action', () => {
-    beforeEach(() => {
-      vi.mock('swr', async () => {
-        const actual = await vi.importActual('swr');
-        return {
-          ...(actual as any),
-          mutate: vi.fn(),
-        };
-      });
-    });
     afterEach(() => {
       // 在每个测试用例开始前恢复到实际的 SWR 实现
       vi.resetAllMocks();
@@ -1644,6 +1657,9 @@ describe('chatMessage actions', () => {
       expect(messageService.getMessages).toHaveBeenCalledWith({
         agentId: 'prefetch-agent',
         groupId: null,
+        // Whole tool payloads: the conversation read only asks for projected
+        // ones for a protocol-v2 client whose runs execute on the server.
+        projectToolPayloads: false,
         threadId: null,
         topicId: 'prefetch-topic',
       });
@@ -1723,6 +1739,7 @@ describe('chatMessage actions', () => {
       expect(messageService.getMessages).toHaveBeenCalledWith({
         agentId: 'prefetch-agent',
         groupId: null,
+        projectToolPayloads: false,
         threadId: null,
         topicId: 'cached-topic',
       });

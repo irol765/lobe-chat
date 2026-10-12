@@ -18,6 +18,7 @@ import file from './file';
 import home from './home';
 import hotkey from './hotkey';
 import image from './image';
+import integration from './integration';
 import knowledgeBase from './knowledgeBase';
 import labs from './labs';
 import marketAuth from './marketAuth';
@@ -39,6 +40,7 @@ import portal from './portal';
 import project from './project';
 import providers from './providers';
 import ragEval from './ragEval';
+import selfLearning from './selfLearning';
 import setting from './setting';
 import spend from './spend';
 import subscription from './subscription';
@@ -72,6 +74,7 @@ const resources = {
   home,
   hotkey,
   image,
+  integration,
   knowledgeBase,
   labs,
   marketAuth,
@@ -93,6 +96,7 @@ const resources = {
   providers,
   project,
   ragEval,
+  selfLearning,
   setting,
   spend,
   subscription,

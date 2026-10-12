@@ -16,8 +16,8 @@ clear next action (CTA + value props); distinguish "no data yet" (onboarding CTA
 "no match for filters" (clear-filters affordance) — they are different screens. When a
 surface keeps its toolbar/header mounted with no data (so a create / `+` affordance
 stays reachable), the **body** below must still render an empty placeholder —
-persistent chrome is no excuse for dead space. Loading uses a skeleton /
-`NeuralNetworkLoading`, never a flash of blank or a layout shift; error surfaces the
+persistent chrome is no excuse for dead space. Loading follows the
+[feedback §4.1](./feedback.md) scenario table, never a flash of blank or a layout shift; error surfaces the
 reason and a retry/back path.
 
 The single most common way this breaks: the fetch reads only `{ data, isLoading }`, never
@@ -109,7 +109,7 @@ Distinguish `error` (transient → reason + retry, keep the URL) from a resolved
 - [ ] A list merged from a fetched set + a **static/frontend set** (`[...fetched, ...placeholders]`, a catalog padded with "coming soon" rows) branches `error` **before** merging — a failed fetch there keeps `length > 0` via the static entries, so neither the empty guard nor an error-unread call site catches it (a plausible partial catalog); `fallbackData: []` makes it automatic. _(Certainty・Meaningful)_
 - [ ] A detail page reads `error` before falling to `NotFound` — a failed fetch shows a reload state, not a "doesn't exist" 404 (deleted vs failed-to-load are different screens). _(Certainty・Meaningful)_
 - [ ] Always-rendered chrome still renders a body empty placeholder. _(Meaningful)_
-- [ ] Loading designed (skeleton / NeuralNetworkLoading), no layout shift — a detail page's "record not loaded yet" is a skeleton, never a bare `return null` / blank. _(Natural)_
+- [ ] Loading designed per feedback §4.1 (skeleton / `Spin`), no layout shift — a detail page's "record not loaded yet" is a skeleton, never a bare `return null` / blank. _(Natural)_
 - [ ] Error designed with reason + retry/back path. _(Meaningful)_
 
 ## 1.2 Lists at scale・Certainty・Natural
@@ -175,15 +175,6 @@ _each_ against the full set, not just the search input.
 > deep-linkable — none of the client-over-partial-page traps that bit the other list audits
 > can occur here. (This is why the surface's only read-side gap is failure handling, not
 > query correctness.)
-
-> ❌ The Pages "all pages" drawer filters `displayDocuments` with a client-side
-> `title/content.includes(keyword)` over the loaded set **and disables load-more while
-> searching**, so searching for a page past the loaded window returns "no results" though it
-> exists (`AllPagesDrawer/Content.tsx`). ✅ Send the keyword to the server query and page
-> through matches.
-> ✅ **Memory** (记忆) does it right: each list tab passes `q` straight into the paginated
-> `queryMemories` server call (`memory/contexts/index.tsx:57-62`, mirrored per tab), so search spans
-> the whole set — no false "no results" for unfetched rows.
 
 **Checklist**
 
@@ -283,6 +274,16 @@ resolved-empty. Once the user manually picks a tab, that choice wins and sticks 
 them off it. Pairs with §1.1: the empty state is the fallback _within_ a view; this rule
 is about not landing on that empty view when a better one exists.
 
+A data-aware shortcut must not erase the stable **hub** behind it. Auto-opening the only
+record can save one click, but if every visit to the collection URL redirects into that record,
+the user loses collection-level actions (create the second item, compare, search, manage) and a
+breadcrumb back becomes a loop. Keep the hub reachable, or preserve every collection-level
+action in the detail surface.
+
+> ❌ **Self-evolving expertise** redirects `/self-learning` to the sole expertise on every
+> visit, while Create exists only on the empty hub. After the first expertise is created, the
+> user cannot return to the hub or create a second one (`SelfLearning/index.tsx`).
+
 > ✅ Opening a document page by clicking a **skill** lands the right panel on the **Skills** tab; a plain document lands on **Documents**.
 > ✅ An agent with only skills (no documents) opens the panel on **Skills** instead of an empty **Documents** tab.
 
@@ -292,6 +293,7 @@ is about not landing on that empty view when a better one exists.
 - [ ] Falls back to a populated view when the default would be empty. _(Certainty)_
 - [ ] Default decided from resolved state, not mid-load. _(Certainty)_
 - [ ] A manual pick is tracked separately and sticks. _(Natural)_
+- [ ] A data-aware shortcut never makes the collection hub or its collection-level actions unreachable. _(Meaningful・Growth)_
 
 ## 1.7 Live / polling streams・Certainty・Natural
 
@@ -446,7 +448,7 @@ UX consequence — a bespoke row is a visible consistency + craft regression.)
 > inside `Accordion` groups via one shared `GroupedAccordion` engine (by-project / by-status /
 > by-time), `Block variant='filled'` for the active row, and spacing as `Flexbox` / `Block`
 > props — every row aligns to its highlight and matches every other panel in the app.
-> ❌ **Verify report sidebar** (`features/Verify/Workspace/ReportListPanel.tsx`) hand-rolls the
+> ❌ **Verify report sidebar** (the since-removed `features/Verify/Workspace/ReportListPanel.tsx`) hand-rolls the
 > entire panel: a raw grid `<div className={styles.item}>` row with `data-active` +
 > `colorFillSecondary` (instead of `NavItem` / `Block variant`), a bordered `<label>` + `<input>`
 > search box, a raw `<input>` inline-rename, an `opacity`-toggled action reveal re-implemented in

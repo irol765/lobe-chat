@@ -44,6 +44,32 @@ describe('MarketSandboxProvider', () => {
     });
   });
 
+  // The instance the call belongs to and where it runs travel together: the
+  // execution plane scopes a shared workspace by the first and runs commands
+  // in the second (LOBE-14363).
+  it('forwards the instance directory and the local working directory together', async () => {
+    const runBuildInTool = vi.fn(async () => ({ data: { result: {} }, success: true }));
+    const marketService = {
+      getSDK: vi.fn(() => ({ plugins: { runBuildInTool } })),
+    } as unknown as MarketService;
+    const provider = new MarketSandboxProvider({
+      marketService,
+      sandboxCwd: 'projects/atlas',
+      sandboxMode: 'persistent',
+      sandboxWorkingDir: '/root/work',
+      topicId: 'topic-1',
+      userId: 'user-1',
+    });
+
+    await provider.callTool('runCommand', { command: 'pwd' });
+
+    expect(runBuildInTool).toHaveBeenCalledWith(
+      'runCommand',
+      { command: 'pwd' },
+      expect.objectContaining({ sandboxCwd: 'projects/atlas', sandboxWorkingDir: '/root/work' }),
+    );
+  });
+
   it('keeps the previous Market sandbox callTool error mapping', async () => {
     const marketService = createMarketService({
       error: {
@@ -174,6 +200,17 @@ describe('MarketSandboxProvider', () => {
         command:
           'LOBEHUB_JWT=[redacted] LOBEHUB_SERVER=https://app.lobehub.com npx -y @lobehub/cli topic list && GITHUB_TOKEN=[redacted] gh repo view',
         timeout: 1000,
+      });
+    });
+
+    it('fully redacts a command that writes into ~/.creds/env, regardless of the credential names it carries', () => {
+      const params = {
+        command:
+          "mkdir -p ~/.creds && \\\n(printf '%s\\n' 'export DC_CLI_TOKEN='\\''sk-super-secret'\\''') >> ~/.creds/env",
+      };
+
+      expect(redactSandboxParams(params)).toEqual({
+        command: '[redacted]',
       });
     });
 

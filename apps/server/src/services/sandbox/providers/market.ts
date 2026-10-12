@@ -2,6 +2,8 @@ import type { SandboxCallToolResult } from '@lobechat/builtin-tool-cloud-sandbox
 import type { CodeInterpreterToolName } from '@lobehub/market-sdk';
 import debug from 'debug';
 
+import { getToolAccessDeniedError } from '@/server/services/toolExecution/errorClassification';
+
 import { SandboxMiddlewareService } from '../service';
 import type {
   SandboxProvider,
@@ -15,6 +17,17 @@ import type {
 const log = debug('lobe-server:sandbox:market');
 const REDACTED_SANDBOX_PARAM = '[redacted]';
 const SANDBOX_AUTH_ENV_PATTERN = /\b(LOBEHUB_JWT|GITHUB_TOKEN)=("[^"]*"|'[^']*'|\S+)/g;
+/**
+ * Any command that writes into `~/.creds/env` (the path documented to the
+ * model as where `injectCredsToSandbox` places credentials) carries
+ * arbitrary, caller-named plaintext secrets whose variable names
+ * `SANDBOX_AUTH_ENV_PATTERN` can't predict. Rather than extend that
+ * name-specific pattern (which would need updating every time a new
+ * credential key shape shows up), blank the whole command when it targets
+ * that path — the credential name/value details aren't worth preserving in
+ * a debug log anyway.
+ */
+const CREDS_ENV_WRITE_PATTERN = />>\s*~\/\.creds\/env\b/;
 
 export class MarketSandboxProvider implements SandboxProvider {
   readonly capabilities = {
@@ -39,28 +52,49 @@ export class MarketSandboxProvider implements SandboxProvider {
     toolName: string,
     params: Record<string, unknown>,
   ): Promise<SandboxCallToolResult> {
-    const { marketService, topicId, userId } = this.options;
+    const {
+      marketService,
+      sandboxCwd,
+      sandboxInstanceId,
+      sandboxMode,
+      sandboxSpecification,
+      sandboxWorkingDir,
+      topicId,
+      userId,
+    } = this.options;
 
     log(
-      'Calling sandbox tool: %s with params: %O, topicId: %s',
+      'Calling sandbox tool: %s with params: %O, topicId: %s, mode: %s',
       toolName,
       redactSandboxParams(params),
       topicId,
+      sandboxMode ?? 'ephemeral',
     );
 
     try {
-      const response = await marketService
-        .getSDK()
-        .plugins.runBuildInTool(toolName as CodeInterpreterToolName, params as never, {
+      const response = await marketService.getSDK().plugins.runBuildInTool(
+        toolName as CodeInterpreterToolName,
+        params as never,
+        {
+          // Cast: the published SDK's context type predates both fields. Market
+          // validates the request body with a non-strict schema, so a field it
+          // does not know yet is dropped rather than rejected — which is what
+          // `sandboxCwd` relies on until the execution plane consumes it.
+          ...(sandboxMode && { sandboxMode }),
+          ...(sandboxCwd && { sandboxCwd }),
+          ...(sandboxWorkingDir && { sandboxWorkingDir }),
+          ...(sandboxInstanceId && { sandboxInstanceId }),
+          ...(sandboxSpecification && { sandboxSpecification }),
           topicId,
           userId,
-        });
+        } as never,
+      );
 
       log('Sandbox tool %s response: %O', toolName, response);
 
       if (!response.success) {
         return {
-          error: {
+          error: getToolAccessDeniedError(response.error, response.error?.message || '') || {
             message: response.error?.message || 'Unknown error',
             name: response.error?.code,
           },
@@ -79,7 +113,7 @@ export class MarketSandboxProvider implements SandboxProvider {
       log('Error calling sandbox tool %s: %O', toolName, error);
 
       return {
-        error: {
+        error: getToolAccessDeniedError(error, (error as Error).message) || {
           message: (error as Error).message,
           name: (error as Error).name,
         },
@@ -108,7 +142,7 @@ export class MarketSandboxProvider implements SandboxProvider {
 
       if (!response.success) {
         return {
-          error: {
+          error: getToolAccessDeniedError(response.error, response.error?.message || '') || {
             message: response.error?.message || 'Failed to export file from sandbox',
             name: response.error?.code,
           },
@@ -135,7 +169,9 @@ export class MarketSandboxProvider implements SandboxProvider {
       log('Error exporting file: %O', error);
 
       return {
-        error: { message: (error as Error).message },
+        error: getToolAccessDeniedError(error, (error as Error).message) || {
+          message: (error as Error).message,
+        },
         success: false,
       };
     }
@@ -153,10 +189,12 @@ export const redactSandboxParams = (params: Record<string, unknown>) => {
   if (params.zipUrl) redacted.zipUrl = REDACTED_SANDBOX_PARAM;
   if (params.skillZipUrls) redacted.skillZipUrls = REDACTED_SANDBOX_PARAM;
   if (typeof params.command === 'string') {
-    redacted.command = params.command.replaceAll(
-      SANDBOX_AUTH_ENV_PATTERN,
-      (_, name: string) => `${name}=${REDACTED_SANDBOX_PARAM}`,
-    );
+    redacted.command = CREDS_ENV_WRITE_PATTERN.test(params.command)
+      ? REDACTED_SANDBOX_PARAM
+      : params.command.replaceAll(
+          SANDBOX_AUTH_ENV_PATTERN,
+          (_, name: string) => `${name}=${REDACTED_SANDBOX_PARAM}`,
+        );
   }
 
   return redacted;

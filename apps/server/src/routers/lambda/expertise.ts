@@ -1,15 +1,33 @@
+import { EXPERTISE_ENFORCEMENTS, EXPERTISE_RULE_DIRECTIONS } from '@lobechat/types';
 import { z } from 'zod';
 
+import {
+  requireWorkspaceRoleWhenScoped,
+  wsCompatProcedure,
+} from '@/business/server/trpc-middlewares/workspaceAuth';
 import { ExpertiseModel } from '@/database/models/expertise';
-import { authedProcedure, router } from '@/libs/trpc/lambda';
+import { ExpertiseRuleRepository } from '@/database/repositories/expertiseRules';
+import { router } from '@/libs/trpc/lambda';
 import { serverDatabase } from '@/libs/trpc/lambda/middleware';
-import { ExpertiseDomainService } from '@/server/services/expertise/domain';
+import {
+  DomainDraftSchema,
+  EditableDomainDraftSchema,
+  ExpertiseDomainService,
+} from '@/server/services/expertise/domain';
 import { ExpertiseIngestionService } from '@/server/services/expertise/ingestion';
+import {
+  DraftRuleInputSchema,
+  ExpertiseRuleDraftService,
+  RULE_DIRECTION_BATCH,
+} from '@/server/services/expertise/rules';
 import { ExpertiseHistoryWorkflow } from '@/server/workflows/expertiseHistory';
 
-import { recentLessonDelta } from './expertiseHelpers';
-
-const expertiseProcedure = authedProcedure.use(serverDatabase).use(async (opts) => {
+/**
+ * Workspace-scoped like every other content router: `wsCompatProcedure` resolves and
+ * authorizes `X-Workspace-Id` (membership in the cloud build), so the models below only
+ * ever see a workspace the caller actually belongs to.
+ */
+const expertiseProcedure = wsCompatProcedure.use(serverDatabase).use(async (opts) => {
   const { ctx } = opts;
   return opts.next({
     ctx: {
@@ -20,6 +38,16 @@ const expertiseProcedure = authedProcedure.use(serverDatabase).use(async (opts) 
         ctx.workspaceId ?? undefined,
       ),
       expertiseIngestionService: new ExpertiseIngestionService(
+        ctx.serverDB,
+        ctx.userId,
+        ctx.workspaceId ?? undefined,
+      ),
+      expertiseRuleRepository: new ExpertiseRuleRepository(
+        ctx.serverDB,
+        ctx.userId,
+        ctx.workspaceId ?? undefined,
+      ),
+      expertiseRuleDraftService: new ExpertiseRuleDraftService(
         ctx.serverDB,
         ctx.userId,
         ctx.workspaceId ?? undefined,
@@ -65,24 +93,27 @@ const toMaturity = (s?: {
   };
 };
 
+/** Anything that changes what the agent learns needs at least member standing in the workspace. */
+const expertiseWriteProcedure = expertiseProcedure.use(requireWorkspaceRoleWhenScoped('member'));
+
 export const expertiseRouter = router({
-  /** L0: all expertise available to an agent and its latest state. */
+  /**
+   * L0: the growth portrait — every bound domain with its habits (active lessons + recent
+   * outcomes), the cumulative-learned series, and the per-run reliability series.
+   * Reliability tiers are folded on the client so one pure helper owns the thresholds.
+   */
   listByAgent: expertiseProcedure
     .input(z.object({ agentId: z.string() }))
     .query(async ({ ctx, input }) => {
       const bound = await ctx.expertiseModel.listDomainsForAgent(input.agentId);
       const domainIds = bound.map((b) => b.domain.id);
-      const [snapshots, actors, insights, series] = await Promise.all([
+      const [snapshots, series, reliability, lessons] = await Promise.all([
         ctx.expertiseModel.latestSnapshots(domainIds),
-        ctx.expertiseModel.actorsByDomain(domainIds),
-        ctx.expertiseModel.listInsights(domainIds),
         ctx.expertiseModel.seriesForDomains(domainIds),
+        ctx.expertiseModel.reliabilitySeries(domainIds),
+        ctx.expertiseModel.listLessonsWithRecent(domainIds),
       ]);
       const snapByDomain = new Map(snapshots.map((s) => [s.domainId, s]));
-      const actorsByDomain = new Map<string, string[]>();
-      for (const a of actors) {
-        actorsByDomain.set(a.domainId, [...(actorsByDomain.get(a.domainId) ?? []), a.actorId]);
-      }
       const seriesByDomain = new Map<string, { n: number; run: number }[]>();
       for (const s of series) {
         seriesByDomain.set(s.domainId, [
@@ -90,43 +121,51 @@ export const expertiseRouter = router({
           { n: s.activeCount, run: s.runIndex },
         ]);
       }
+      const reliabilityByDomain = new Map<
+        string,
+        { pass: number; run: number; violation: number }[]
+      >();
+      for (const r of reliability) {
+        reliabilityByDomain.set(r.domainId, [
+          ...(reliabilityByDomain.get(r.domainId) ?? []),
+          { pass: r.pass, run: r.runIndex, violation: r.violation },
+        ]);
+      }
+      const lessonsByDomain = new Map<string, typeof lessons>();
+      for (const l of lessons) {
+        lessonsByDomain.set(l.domainId, [...(lessonsByDomain.get(l.domainId) ?? []), l]);
+      }
 
-      const domains = bound.map(({ binding, domain }) => {
+      const domains = bound.map(({ domain }) => {
         const snap = snapByDomain.get(domain.id);
-        const points = seriesByDomain.get(domain.id) ?? [];
-        // Net change over the latest five runs distinguishes growth, retirement, and no learning.
-        const delta = recentLessonDelta(points);
         return {
-          activeRate: snap?.activeRate ?? null,
-          actors: actorsByDomain.get(domain.id) ?? [],
-          canonCoverage: snap?.canonCoverage ?? null,
-          contributionMode: binding.contributionMode,
-          delta,
+          canonEntries: domain.canonEntries,
+          domainFilter: domain.domainFilter,
           id: domain.id,
-          /** Timestamp of the latest practice run. */
           lastPracticedAt: snap?.capturedAt ?? null,
-          layerCounts: snap?.layerCounts ?? {},
-          layerCoverage: snap?.layerCoverage ?? null,
+          layerCanonRef: domain.anchorCandidates?.[0]?.layerCanonRef ?? null,
           layers: domain.layers,
           layerSource: domain.layerSource,
-          lessonCount: snap?.activeCount ?? 0,
-          maturity: toMaturity(snap),
+          lessons: (lessonsByDomain.get(domain.id) ?? []).map((l) => ({
+            code: l.code,
+            createdAt: l.createdAt,
+            hitCount: l.hitCount,
+            id: l.id,
+            lastHitAt: l.lastHitAt,
+            layer: l.layer,
+            recent: l.recent,
+            taughtByUser: l.taughtByUser,
+            title: l.title,
+          })),
+          outOfScope: domain.outOfScope,
+          reliability: reliabilityByDomain.get(domain.id) ?? [],
           runCount: snap?.runIndex ?? 0,
-          /** Series used by the overlaid maturity chart. */
-          series: points,
-          slug: domain.slug,
+          series: seriesByDomain.get(domain.id) ?? [],
           title: domain.title,
         };
       });
 
-      return {
-        domains,
-        insights,
-        totals: {
-          domains: domains.length,
-          lessons: domains.reduce((a, d) => a + d.lessonCount, 0),
-        },
-      };
+      return { domains };
     }),
 
   /** L1: the complete SCLPT domain state and time series. */
@@ -163,6 +202,7 @@ export const expertiseRouter = router({
           compiledCount: s.compiledCount,
           /** Controls whether the chart marks this run as human-assisted. */
           hadHumanInLoop: humanByRun.get(s.runIndex) ?? false,
+          learnedTotal: s.learnedTotal,
           runIndex: s.runIndex,
         })),
         tailGain,
@@ -198,18 +238,202 @@ export const expertiseRouter = router({
       return { hits, lesson };
     }),
 
-  /** Creates an expertise domain from a natural-language brief. */
-  createDomain: expertiseProcedure
+  /**
+   * The reviewer's own rules, grouped, plus how many rejected rounds are still waiting to be
+   * read. The backlog travels with the list because an empty page has to say *why* it is empty —
+   * distillation only fires when a later round lands, so old rejections never arrive on their own.
+   */
+  listRules: expertiseProcedure.query(async ({ ctx }) => {
+    const [groups, backlogRounds] = await Promise.all([
+      ctx.expertiseModel.listRules(),
+      ctx.expertiseModel.countUndistilledRejectionRounds(),
+    ]);
+    return { backlogRounds, groups };
+  }),
+
+  /** The rejections one rule was distilled from, linked back to the acceptance round. */
+  ruleSources: expertiseProcedure
+    .input(z.object({ lessonId: z.string() }))
+    .query(async ({ ctx, input }) => ctx.expertiseModel.listLessonSources(input.lessonId)),
+
+  /** The edits one rule has been through, so a reader can see who narrowed it and when. */
+  ruleRevisions: expertiseProcedure
+    .input(z.object({ lessonId: z.string() }))
+    .query(async ({ ctx, input }) => ctx.expertiseModel.listLessonRevisions(input.lessonId)),
+
+  /**
+   * Drafts one rule from whatever the reviewer typed or pasted. Nothing is written: the draft
+   * comes back for review and only `createRule` persists it.
+   */
+  // Drafting spends model capacity on something only a member can save, so it is gated the same.
+  draftRule: expertiseWriteProcedure
+    .input(DraftRuleInputSchema)
+    .mutation(async ({ ctx, input }) => ctx.expertiseRuleDraftService.draftRule(input)),
+
+  /**
+   * Settles which way the named unjudged rules push the work, one bounded batch per call. The
+   * page names the batch from the list it read; a rule the reviewer already set is never
+   * overwritten.
+   */
+  judgeRuleDirections: expertiseWriteProcedure
+    .input(z.object({ lessonIds: z.array(z.string()).min(1).max(RULE_DIRECTION_BATCH) }))
+    .mutation(async ({ ctx, input }) =>
+      ctx.expertiseRuleDraftService.judgeDirections(input.lessonIds),
+    ),
+
+  /** Drafts a group (name + gate question) from a sentence; `createRuleGroup` persists it. */
+  draftRuleGroup: expertiseWriteProcedure
+    .input(z.object({ brief: z.string().min(1).max(20_000) }))
+    .mutation(async ({ ctx, input }) => ctx.expertiseRuleDraftService.draftRuleGroup(input)),
+
+  /** A rule the reviewer writes down by hand. */
+  createRule: expertiseWriteProcedure
     .input(
       z.object({
-        agentId: z.string(),
-        brief: z.string().min(1),
+        // `compiled` is only true once the compiler links a criterion; nobody can claim it by hand.
+        compilability: z.enum(['compilable', 'not-compilable']).optional(),
+        domainId: z.string(),
+        direction: z.enum(EXPERTISE_RULE_DIRECTIONS).optional(),
+        enforcement: z.enum(EXPERTISE_ENFORCEMENTS).optional(),
+        how: z.string().max(8000).optional(),
+        limits: z.string().max(4000).optional(),
+        title: z.string().min(1).max(500),
+        why: z.string().max(4000).optional(),
       }),
     )
-    .mutation(async ({ ctx, input }) => ctx.expertiseDomainService.createFromBrief(input)),
+    .mutation(async ({ ctx, input }) => ctx.expertiseModel.createRule(input)),
+
+  /** Field-level edits from the rule document; wording edits are versioned. */
+  updateRule: expertiseWriteProcedure
+    .input(
+      z.object({
+        // `compiled` is only true once the compiler links a criterion; nobody can claim it by hand.
+        compilability: z.enum(['compilable', 'not-compilable']).optional(),
+        direction: z.enum(EXPERTISE_RULE_DIRECTIONS).optional(),
+        enforcement: z.enum(EXPERTISE_ENFORCEMENTS).optional(),
+        lessonId: z.string(),
+        reasonKind: z.enum(['mechanism', 'taste']).optional(),
+        sections: z
+          .object({
+            how: z.string().max(8000).nullable().optional(),
+            limits: z.string().max(4000).nullable().optional(),
+            rule: z.string().max(4000).nullable().optional(),
+            why: z.string().max(4000).nullable().optional(),
+          })
+          .optional(),
+        title: z.string().min(1).max(500).optional(),
+      }),
+    )
+    .mutation(async ({ ctx, input }) => {
+      const { lessonId, ...patch } = input;
+      return ctx.expertiseRuleRepository.updateRule(lessonId, patch);
+    }),
+
+  /** The order the reviewer dragged one group into. */
+  /** Moves one rule within its group: before `beforeId`, or to the end when it is null. */
+  reorderRule: expertiseWriteProcedure
+    .input(
+      z.object({ beforeId: z.string().nullable(), domainId: z.string(), lessonId: z.string() }),
+    )
+    .mutation(async ({ ctx, input }) =>
+      ctx.expertiseModel.reorderRule(input.domainId, input.lessonId, input.beforeId),
+    ),
+
+  /** Files a rule under another group. */
+  moveRule: expertiseWriteProcedure
+    .input(z.object({ domainId: z.string(), lessonId: z.string() }))
+    .mutation(async ({ ctx, input }) =>
+      ctx.expertiseModel.moveRule(input.lessonId, input.domainId),
+    ),
+
+  /** Folds one rule into another; the source is archived with a pointer to where it went. */
+  mergeRules: expertiseWriteProcedure
+    .input(z.object({ fromId: z.string(), intoId: z.string() }))
+    .mutation(async ({ ctx, input }) =>
+      ctx.expertiseRuleRepository.mergeRules(input.fromId, input.intoId),
+    ),
+
+  /** Puts an archived rule back into practice. */
+  restoreLesson: expertiseWriteProcedure
+    .input(z.object({ lessonId: z.string() }))
+    .mutation(async ({ ctx, input }) => ctx.expertiseModel.restoreLesson(input.lessonId)),
+
+  /** A group the reviewer opens by hand; it mounts on them, so every acceptance can add to it. */
+  createRuleGroup: expertiseWriteProcedure
+    .input(
+      z.object({
+        gate: z.string().min(1).max(1000),
+        outOfScope: z.string().max(1000).optional(),
+        title: z.string().min(1).max(200),
+      }),
+    )
+    .mutation(async ({ ctx, input }) => ctx.expertiseModel.createRuleGroup(input)),
+
+  /** Renames a group or rewrites its gate question. */
+  updateRuleGroup: expertiseWriteProcedure
+    .input(
+      z.object({
+        domainId: z.string(),
+        gate: z.string().min(1).max(1000).optional(),
+        outOfScope: z.string().max(1000).nullable().optional(),
+        title: z.string().min(1).max(200).optional(),
+      }),
+    )
+    .mutation(async ({ ctx, input }) => {
+      const { domainId, ...patch } = input;
+      return ctx.expertiseModel.updateRuleGroup(domainId, patch);
+    }),
+
+  /** Step 1 of creation: interpret the brief into an editable draft. Nothing is persisted. */
+  draftDomain: expertiseWriteProcedure
+    .input(
+      z.object({
+        adjustment: z.string().min(1).max(2000).optional(),
+        agentId: z.string(),
+        brief: z.string().min(1),
+        currentDraft: EditableDomainDraftSchema.optional(),
+      }),
+    )
+    .mutation(async ({ ctx, input }) => ctx.expertiseDomainService.draftFromBrief(input)),
+
+  /** Step 2 of creation: persist the reviewed anchor and bind it to the agent. */
+  createDomain: expertiseWriteProcedure
+    .input(DomainDraftSchema.extend({ agentId: z.string(), brief: z.string().min(1) }))
+    .mutation(async ({ ctx, input }) => ctx.expertiseDomainService.create(input)),
+
+  /** The user drops a direction; everything learned in it goes with it. */
+  deleteDomain: expertiseWriteProcedure
+    .input(z.object({ domainId: z.string() }))
+    .mutation(async ({ ctx, input }) => ctx.expertiseModel.deleteDomain(input.domainId)),
+
+  /** How many past conversations a history warm-up would read. */
+  countHistory: expertiseProcedure
+    .input(z.object({ agentId: z.string() }))
+    .query(async ({ ctx, input }) => ({
+      candidateCount: await ctx.expertiseIngestionService.countHistoricalTopics(input.agentId),
+    })),
+
+  /** The user teaches one lesson directly, in their own words. */
+  teachLesson: expertiseWriteProcedure
+    .input(z.object({ domainId: z.string(), text: z.string().min(1).max(2000) }))
+    .mutation(async ({ ctx, input }) =>
+      ctx.expertiseModel.teachLesson({ domainId: input.domainId, text: input.text }),
+    ),
+
+  /** The user corrects a lesson; the correction is versioned and joins the lesson body. */
+  reviseLesson: expertiseWriteProcedure
+    .input(z.object({ lessonId: z.string(), text: z.string().min(1).max(2000) }))
+    .mutation(async ({ ctx, input }) =>
+      ctx.expertiseModel.reviseLesson(input.lessonId, input.text),
+    ),
+
+  /** The user asks it to forget a lesson. */
+  retireLesson: expertiseWriteProcedure
+    .input(z.object({ lessonId: z.string() }))
+    .mutation(async ({ ctx, input }) => ctx.expertiseModel.retireLesson(input.lessonId)),
 
   /** Explicitly bootstraps expertise from conversations that existed before the domain did. */
-  ingestHistory: expertiseProcedure
+  ingestHistory: expertiseWriteProcedure
     .input(z.object({ agentId: z.string() }))
     .mutation(async ({ ctx, input }) => {
       const candidateCount = await ctx.expertiseIngestionService.countHistoricalTopics(
@@ -226,7 +450,7 @@ export const expertiseRouter = router({
     }),
 
   /** Dismisses an incorrect generated insight. */
-  dismissInsight: expertiseProcedure
+  dismissInsight: expertiseWriteProcedure
     .input(z.object({ insightId: z.string(), reason: z.string().optional() }))
     .mutation(async ({ ctx, input }) => {
       await ctx.expertiseModel.dismissInsight(input.insightId, input.reason);

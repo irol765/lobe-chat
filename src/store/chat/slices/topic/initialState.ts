@@ -1,9 +1,11 @@
-import { type ChatTopic } from '@/types/topic';
+import { createReplicaState, type ReplicaPagedData, type ReplicaState } from '@/libs/replica';
+import { type ChatTopic, type TopicQuerySortBy } from '@/types/topic';
 
 /**
- * Unified topic data structure for each agent
+ * Unified topic data structure for each agent: the generic local-first paged
+ * view plus topic query descriptors.
  */
-export interface TopicData {
+export interface TopicData extends ReplicaPagedData<ChatTopic, number> {
   currentPage: number;
   excludeStatuses?: string[];
   excludeTriggers?: string[];
@@ -24,6 +26,8 @@ export interface TopicData {
    * or cases where total items < pageSize.
    */
   pageSize: number;
+  /** Server-side ordering the bucket was fetched with (part of its query identity). */
+  sortBy?: TopicQuerySortBy;
   total: number;
   /**
    * Tracks whether the first fetch for this container asked the server for
@@ -44,6 +48,8 @@ export interface ChatTopicState {
    * lands last wins, tangling both views.
    */
   agentTopicsViewMap: Record<string, TopicData>;
+  /** Local-first bookkeeping for `agentTopicsViewMap`. */
+  agentTopicsViewReplica: ReplicaState<TopicData>;
   /**
    * whether all topics drawer is open
    */
@@ -69,6 +75,26 @@ export interface ChatTopicState {
    * Contains items, total count, pagination state, and loading states
    */
   topicDataMap: Record<string, TopicData>;
+  /**
+   * Per-id topic detail cache, filled by `useFetchTopicDetail` when the active
+   * topic is missing from the loaded list bucket — e.g. an archived
+   * (`completed`) topic that the sidebar fetch excludes via `excludeStatuses`.
+   * `currentActiveTopic` / `getTopicById` read it as a fallback so the header
+   * keeps the real title instead of degrading to the "new topic" placeholder.
+   */
+  topicDetailMap: Record<string, ChatTopic>;
+  /** Local-first bookkeeping for `topicDetailMap`. */
+  topicDetailReplica: ReplicaState<ChatTopic>;
+  /** Topics with effort selections queued or being persisted. */
+  topicEffortUpdatingIds: string[];
+  /** Local-first bookkeeping for `topicDataMap` (scope, optimistic overlays). */
+  topicListReplica: ReplicaState<TopicData>;
+  /**
+   * Internal ref-count for topic loading owners. A topic can be loading because
+   * the agent is running and because title-summary is streaming at the same time.
+   */
+  topicLoadingIdCounts: Record<string, number>;
+  topicLoadingIds: string[];
   topicRenamingId?: string;
   topicSearchKeywords: string;
 }
@@ -76,11 +102,18 @@ export interface ChatTopicState {
 export const initialTopicState: ChatTopicState = {
   activeTopicId: null as any,
   agentTopicsViewMap: {},
+  agentTopicsViewReplica: createReplicaState<TopicData>(),
   creatingTopicIds: [],
   allTopicsDrawerOpen: false,
   creatingTopic: false,
   isSearchingTopic: false,
   searchTopics: [],
   topicDataMap: {},
+  topicDetailMap: {},
+  topicDetailReplica: createReplicaState<ChatTopic>(),
+  topicListReplica: createReplicaState<TopicData>(),
+  topicLoadingIdCounts: {},
+  topicLoadingIds: [],
+  topicEffortUpdatingIds: [],
   topicSearchKeywords: '',
 };

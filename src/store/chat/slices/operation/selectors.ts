@@ -7,6 +7,8 @@ import {
   AI_RUNTIME_OPERATION_TYPES,
   INPUT_LOADING_OPERATION_TYPES,
   isQueueBlockingOperation,
+  QUEUE_BLOCKING_OPERATION_TYPES,
+  SEND_NOW_CANCEL_REASON,
 } from './types';
 
 // === Basic Queries ===
@@ -228,6 +230,37 @@ const getOperationsByContext =
   };
 
 /**
+ * Whether a later conversation operation has taken ownership of this context.
+ *
+ * A run can publish `visible_output_end` before its terminal snapshot arrives,
+ * which intentionally lets the next send start. The old snapshot must not then
+ * replace the newer turn's optimistic messages. Status is deliberately ignored:
+ * the newer send may already have handed off to its runtime (or even settled),
+ * but its later registration in the context index still proves that the older
+ * snapshot is superseded. The index is local insertion order, so it remains
+ * monotonic even when restored server timestamps and the client clock differ.
+ * Child operations stay within their parent's turn and therefore cannot claim
+ * conversation ownership from that turn's terminal reconciliation.
+ */
+const hasNewerConversationOperation =
+  (operationId: string, context: Operation['context']) =>
+  (s: ChatStoreState): boolean => {
+    const operation = s.operations[operationId];
+    if (!operation || !context.agentId) return false;
+
+    const operations = getOperationsByContext({ ...context, agentId: context.agentId })(s);
+    const operationIndex = operations.findIndex((candidate) => candidate.id === operationId);
+    if (operationIndex < 0) return false;
+
+    return operations
+      .slice(operationIndex + 1)
+      .some(
+        (candidate) =>
+          !candidate.parentOperationId && QUEUE_BLOCKING_OPERATION_TYPES.includes(candidate.type),
+      );
+  };
+
+/**
  * Check if there's a running operation in a specific context
  * Use this for loading states in components that display a specific conversation
  */
@@ -295,6 +328,26 @@ const getRunningQueueBlockingOperationIds =
       .map((op) => op.id);
   };
 
+const getOperationTurnStartTime = (op: Operation) =>
+  op.metadata.turnStartTime ?? op.metadata.startTime;
+
+const isTurnTimedOperation = (op: Operation) =>
+  AI_RUNTIME_OPERATION_TYPES.includes(op.type) || op.metadata.turnStartTime !== undefined;
+
+const getLatestAgentRuntimeTurnStartTime =
+  (context: MessageMapKeyInput) =>
+  (s: ChatStoreState): number | undefined => {
+    if (!context.agentId) return undefined;
+
+    let latest: Operation | undefined;
+    for (const op of getOperationsByContext(context)(s)) {
+      if (!AI_RUNTIME_OPERATION_TYPES.includes(op.type)) continue;
+      if (!latest || op.metadata.startTime > latest.metadata.startTime) latest = op;
+    }
+
+    return latest ? getOperationTurnStartTime(latest) : undefined;
+  };
+
 /**
  * Get the earliest start time for a running agent runtime operation in a
  * specific context. This anchors visible elapsed-time UI to the top-level
@@ -317,10 +370,8 @@ const getAgentRuntimeStartTimeByContext =
         continue;
       }
 
-      startTime =
-        startTime === undefined
-          ? op.metadata.startTime
-          : Math.min(startTime, op.metadata.startTime);
+      const turnStartTime = getOperationTurnStartTime(op);
+      startTime = startTime === undefined ? turnStartTime : Math.min(startTime, turnStartTime);
     }
 
     return startTime;
@@ -338,14 +389,12 @@ const getVisibleAgentRuntimeStartTimeByContext =
     let startTime: number | undefined;
 
     for (const op of operations) {
-      if (!AI_RUNTIME_OPERATION_TYPES.includes(op.type) || !isVisiblyRunningOperation(op)) {
+      if (!isTurnTimedOperation(op) || !isVisiblyRunningOperation(op)) {
         continue;
       }
 
-      startTime =
-        startTime === undefined
-          ? op.metadata.startTime
-          : Math.min(startTime, op.metadata.startTime);
+      const turnStartTime = getOperationTurnStartTime(op);
+      startTime = startTime === undefined ? turnStartTime : Math.min(startTime, turnStartTime);
     }
 
     return startTime;
@@ -398,7 +447,9 @@ const isInputVisiblyLoadingByContext =
     const hasRunning = operations.some(
       (op) => INPUT_LOADING_OPERATION_TYPES.includes(op.type) && isRunningOperation(op),
     );
-    return hasRunning && getQueuedMessages(context)(s).length > 0;
+    if (hasRunning) return getQueuedMessages(context)(s).length > 0;
+
+    return isSteerHandoffPending(context)(s);
   };
 
 // === Backward Compatibility ===
@@ -879,6 +930,34 @@ const getQueuedMessages = (context: MessageMapKeyInput) => (s: ChatStoreState) =
   return s.queuedMessages[messageMapKey(context)] ?? [];
 };
 
+const getIdleQueueHost = (context: MessageMapKeyInput) => (s: ChatStoreState) => {
+  if (getQueuedMessages(context)(s).length === 0) return;
+
+  let latest: Operation | undefined;
+  for (const op of getOperationsByContext(context)(s)) {
+    if (!INPUT_LOADING_OPERATION_TYPES.includes(op.type)) continue;
+    if (isRunningOperation(op)) return;
+    if (!AI_RUNTIME_OPERATION_TYPES.includes(op.type)) continue;
+    if (!latest || op.metadata.startTime > latest.metadata.startTime) latest = op;
+  }
+
+  return latest;
+};
+
+// A successful top-level run always drains its queue into a steered send, so a
+// queue sitting behind a completed run is the hand-off window, not a stale queue.
+const isQueueDrainPending = (context: MessageMapKeyInput) => (s: ChatStoreState) =>
+  getIdleQueueHost(context)(s)?.status === 'completed';
+
+// Send now keeps its item queued until the interrupt is confirmed; that wait is
+// part of the hand-off too, but its own send must not be re-queued.
+const isSteerHandoffPending = (context: MessageMapKeyInput) => (s: ChatStoreState) => {
+  const host = getIdleQueueHost(context)(s);
+  if (host?.status === 'completed') return true;
+
+  return host?.status === 'cancelled' && host.metadata.cancelReason === SEND_NOW_CANCEL_REASON;
+};
+
 /**
  * Operation Selectors
  */
@@ -896,6 +975,7 @@ export const operationSelectors = {
   getOperationById,
   getOperationContextFromMessage,
   getAgentRuntimeStartTimeByContext,
+  getLatestAgentRuntimeTurnStartTime,
   getOperationsByContext,
   getOperationsByMessage,
   getOperationsByType,
@@ -903,6 +983,7 @@ export const operationSelectors = {
   getRunningQueueBlockingOperationIds,
   getRunningToolCallStartTime,
   hasAnyRunningOperation,
+  hasNewerConversationOperation,
   hasRunningOperationByContext,
   hasRunningOperationType,
   /** @deprecated Use isAgentRuntimeRunning instead */
@@ -935,7 +1016,9 @@ export const operationSelectors = {
   isMessageProcessing,
   isMessageRegenerating,
   isRegenerating,
+  isQueueDrainPending,
   isSendingMessage,
+  isSteerHandoffPending,
   isTopicUnreadCompleted,
   isTopicVisiblyRunning,
   unreadCompletedCountForTopics,

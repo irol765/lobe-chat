@@ -14,8 +14,6 @@ import { withSWR } from '~test-utils';
 import { useFileStore as useStore } from '../../store';
 import * as resourceHooks from '../resource/hooks';
 
-vi.mock('zustand/traditional');
-
 // Mock i18next translation function
 vi.mock('i18next', () => ({
   t: (key: string, options?: any) => {
@@ -28,13 +26,6 @@ vi.mock('i18next', () => ({
 }));
 
 // Mock message
-vi.mock('@/components/AntdStaticMethods', () => ({
-  message: {
-    info: vi.fn(),
-    warning: vi.fn(),
-  },
-}));
-
 // Mock unzipFile
 vi.mock('@/utils/unzipFile', () => ({
   unzipFile: vi.fn(),
@@ -597,6 +588,27 @@ describe('FileManagerActions', () => {
       });
 
       // Should not auto-parse unsupported files
+      expect(parseSpy).not.toHaveBeenCalled();
+    });
+
+    // https://github.com/lobehub/lobehub/issues/19620
+    it('should skip auto-embed for formats no chunking loader can parse', async () => {
+      const { result } = renderHook(() => useStore());
+
+      const dwgFile = new File(['dwg content'], 'floor-plan.dwg', { type: '' });
+      const binFile = new File(['bin content'], 'model.dxf', {
+        type: 'application/octet-stream',
+      });
+
+      vi.spyOn(result.current, 'uploadWithProgress')
+        .mockResolvedValueOnce({ id: 'file-1', url: 'http://example.com/file-1' })
+        .mockResolvedValueOnce({ id: 'file-2', url: 'http://example.com/file-2' });
+      const parseSpy = vi.spyOn(result.current, 'parseFilesToChunks').mockResolvedValue();
+
+      await act(async () => {
+        await result.current.pushDockFileList([dwgFile, binFile]);
+      });
+
       expect(parseSpy).not.toHaveBeenCalled();
     });
 

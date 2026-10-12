@@ -1,12 +1,12 @@
 'use client';
 
-import { Center, Flexbox, Text } from '@lobehub/ui';
+import { Center, Flexbox } from '@lobehub/ui';
+import { Spin, Text } from '@lobehub/ui/base-ui';
 import { memo, useCallback, useLayoutEffect } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useParams } from 'react-router';
 
 import AsyncError from '@/components/AsyncError';
-import NeuralNetworkLoading from '@/components/NeuralNetworkLoading';
 import NavHeader from '@/features/NavHeader';
 import { useInitAgentConfig } from '@/hooks/useInitAgentConfig';
 import ChatConversation from '@/routes/(main)/agent/features/Conversation';
@@ -24,6 +24,7 @@ const ProjectConversation = memo(() => {
   const detail = useCurrentProjectDetail(projectId);
   const detailSWR = useProjectStore((s) => s.useFetchProjectDetail)(projectId);
   const coordinatorAgentId = detail?.project.coordinatorAgentId;
+  const projectSlug = detail?.project.slug ?? projectId;
   const topicTitle = useChatStore((s) =>
     topicId ? topicSelectors.getTopicById(topicId)(s)?.title : undefined,
   );
@@ -46,21 +47,21 @@ const ProjectConversation = memo(() => {
   }, [coordinatorAgentId]);
 
   const getConversationPath = useCallback(
-    () => getProjectConversationPath(projectId!),
-    [projectId],
+    () => getProjectConversationPath(projectSlug!),
+    [projectSlug],
   );
   const getTopicPath = useCallback(
-    (_agentId: string, topicId: string) => getProjectConversationPath(projectId!, topicId),
-    [projectId],
+    (_agentId: string, topicId: string) => getProjectConversationPath(projectSlug!, topicId),
+    [projectSlug],
   );
 
-  if (detailSWR.error) {
-    return <AsyncError error={detailSWR.error} variant="page" onRetry={detailSWR.mutate} />;
+  if (detailSWR.error && !detail) {
+    return <AsyncError error={detailSWR.error} variant="page" onRetry={detailSWR.revalidate} />;
   }
-  if (detailSWR.isLoading || !coordinatorAgentId) {
+  if (!detail || !coordinatorAgentId) {
     return (
       <Center height="100%" width="100%">
-        <NeuralNetworkLoading />
+        <Spin size="small" />
       </Center>
     );
   }

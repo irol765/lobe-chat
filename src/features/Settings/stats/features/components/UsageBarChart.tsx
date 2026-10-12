@@ -1,7 +1,7 @@
 import { type BarChartProps } from '@lobehub/charts';
 import { BarChart, ChartTooltipFrame, ChartTooltipRow } from '@lobehub/charts';
-import { Flexbox, Text } from '@lobehub/ui';
-import { Divider } from 'antd';
+import { Flexbox } from '@lobehub/ui';
+import { Divider, Text } from '@lobehub/ui/base-ui';
 
 import { formatNumber, formatTokenNumber } from '@/utils/format';
 

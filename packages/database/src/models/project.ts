@@ -1,8 +1,9 @@
 import { createProjectCoordinatorAgentConfig } from '@lobechat/builtin-agents';
 import type { ProjectStatus, ProjectVisibility } from '@lobechat/types';
-import { and, asc, desc, eq, inArray, isNull, max, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, isNull, max, or, sql } from 'drizzle-orm';
 
 import { agents } from '../schemas/agent';
+import { environments } from '../schemas/environment';
 import { knowledgeBases } from '../schemas/file';
 import {
   projectAgents,
@@ -10,10 +11,15 @@ import {
   projectKnowledgeBases,
   projects,
 } from '../schemas/project';
+import { projectEnvironments } from '../schemas/projectEnvironment';
+import { projectWorks } from '../schemas/projectWork';
 import { tasks } from '../schemas/task';
+import { topics } from '../schemas/topic';
+import { works } from '../schemas/work';
 import type { LobeChatDatabase } from '../type';
 import { buildWorkspacePayload, buildWorkspaceWhere } from '../utils/workspace';
 import { AgentModel } from './agent';
+import { EnvironmentModel } from './environment';
 
 export interface CreateProjectInput {
   avatar?: string;
@@ -44,6 +50,11 @@ export interface ProjectKnowledgeBaseInput {
   enabled?: boolean;
   knowledgeBaseId: string;
   sortOrder?: number;
+}
+
+export interface ProjectWorkInput {
+  sortOrder?: number;
+  workId: string;
 }
 
 export class ProjectModel {
@@ -132,6 +143,23 @@ export class ProjectModel {
       .select()
       .from(projects)
       .where(and(eq(projects.id, id), this.readable()))
+      .limit(1);
+    return project ?? null;
+  }
+
+  async findByIds(ids: string[]) {
+    if (ids.length === 0) return [];
+    return this.db
+      .select()
+      .from(projects)
+      .where(and(inArray(projects.id, ids), this.readable()));
+  }
+
+  async findByIdOrSlug(reference: string) {
+    const [project] = await this.db
+      .select()
+      .from(projects)
+      .where(and(or(eq(projects.id, reference), eq(projects.slug, reference)), this.readable()))
       .limit(1);
     return project ?? null;
   }
@@ -320,9 +348,63 @@ export class ProjectModel {
     return deleted.length > 0;
   }
 
-  async listTasks(projectId: string) {
+  async listWorks(projectId: string) {
     if (!(await this.findById(projectId))) return null;
     return this.db
+      .select({ binding: projectWorks, work: works })
+      .from(projectWorks)
+      .innerJoin(works, eq(projectWorks.workId, works.id))
+      .where(
+        and(
+          eq(projectWorks.projectId, projectId),
+          buildWorkspaceWhere({ userId: this.userId, workspaceId: this.workspaceId }, works),
+        ),
+      )
+      .orderBy(asc(projectWorks.sortOrder), asc(projectWorks.createdAt));
+  }
+
+  async addWork(projectId: string, input: ProjectWorkInput) {
+    if (!(await this.findManageableById(projectId))) return null;
+    const [work] = await this.db
+      .select({ id: works.id })
+      .from(works)
+      .where(
+        and(
+          eq(works.id, input.workId),
+          buildWorkspaceWhere({ userId: this.userId, workspaceId: this.workspaceId }, works),
+        ),
+      )
+      .limit(1);
+    if (!work) throw new Error('Work not found');
+
+    const [binding] = await this.db
+      .insert(projectWorks)
+      .values({
+        ...input,
+        addedByUserId: this.userId,
+        projectId,
+        workspaceId: this.workspaceId ?? null,
+      })
+      .onConflictDoUpdate({
+        set: { sortOrder: input.sortOrder, updatedAt: new Date() },
+        target: [projectWorks.projectId, projectWorks.workId],
+      })
+      .returning();
+    return binding;
+  }
+
+  async removeWork(projectId: string, workId: string) {
+    if (!(await this.findManageableById(projectId))) return false;
+    const deleted = await this.db
+      .delete(projectWorks)
+      .where(and(eq(projectWorks.projectId, projectId), eq(projectWorks.workId, workId)))
+      .returning({ id: projectWorks.id });
+    return deleted.length > 0;
+  }
+
+  async listTasks(projectId: string) {
+    if (!(await this.findById(projectId))) return null;
+    const rows = await this.db
       .select()
       .from(tasks)
       .where(
@@ -331,6 +413,7 @@ export class ProjectModel {
           buildWorkspaceWhere(
             { userId: this.userId, workspaceId: this.workspaceId },
             {
+              isDeleted: tasks.isDeleted,
               userId: tasks.createdByUserId,
               visibility: tasks.visibility,
               workspaceId: tasks.workspaceId,
@@ -339,6 +422,8 @@ export class ProjectModel {
         ),
       )
       .orderBy(asc(tasks.sortOrder), asc(tasks.seq));
+
+    return rows;
   }
 
   async getEnabledKnowledgeBaseIdsForTask(taskId: string) {
@@ -351,6 +436,7 @@ export class ProjectModel {
           buildWorkspaceWhere(
             { userId: this.userId, workspaceId: this.workspaceId },
             {
+              isDeleted: tasks.isDeleted,
               userId: tasks.createdByUserId,
               visibility: tasks.visibility,
               workspaceId: tasks.workspaceId,
@@ -383,6 +469,7 @@ export class ProjectModel {
     const taskScope = buildWorkspaceWhere(
       { userId: this.userId, workspaceId: this.workspaceId },
       {
+        isDeleted: tasks.isDeleted,
         userId: tasks.createdByUserId,
         visibility: tasks.visibility,
         workspaceId: tasks.workspaceId,
@@ -536,5 +623,86 @@ export class ProjectModel {
       .where(and(eq(projects.id, id), this.manageable()))
       .limit(1);
     return project ?? null;
+  }
+
+  /** Link an existing environment to a project; re-attaching is a no-op. */
+  async attachEnvironment(projectId: string, environmentId: string) {
+    if (!(await this.findManageableById(projectId)))
+      throw new Error('Project not found or access denied');
+    const environment = await new EnvironmentModel(
+      this.db,
+      this.userId,
+      this.workspaceId,
+    ).findEnabledById(environmentId);
+    if (!environment) throw new Error('Environment not found or access denied');
+    await this.db
+      .insert(projectEnvironments)
+      .values({
+        projectId,
+        environmentId,
+        workspaceId: this.workspaceId,
+        addedByUserId: this.userId,
+      })
+      .onConflictDoNothing();
+    return { projectId, environmentId };
+  }
+
+  /** Enabled environments linked to this project. */
+  async listEnvironments(projectId: string) {
+    if (!(await this.findById(projectId))) throw new Error('Project not found or access denied');
+    return this.db
+      .select({
+        id: environments.id,
+        name: environments.name,
+        configuration: environments.configuration,
+      })
+      .from(environments)
+      .innerJoin(
+        projectEnvironments,
+        and(
+          eq(projectEnvironments.environmentId, environments.id),
+          eq(projectEnvironments.projectId, projectId),
+          eq(projectEnvironments.enabled, true),
+        ),
+      )
+      .where(
+        and(
+          buildWorkspaceWhere({ userId: this.userId, workspaceId: this.workspaceId }, environments),
+          eq(environments.enabled, true),
+        ),
+      );
+  }
+
+  /** All conversations belonging to the project, with or without a working directory. */
+  async listTopics(projectId: string) {
+    if (!(await this.findById(projectId))) throw new Error('Project not found or access denied');
+    const scope = { userId: this.userId, workspaceId: this.workspaceId };
+    return this.db
+      .select({
+        id: topics.id,
+        createdAt: topics.createdAt,
+        favorite: topics.favorite,
+        metadata: topics.metadata,
+        trigger: topics.trigger,
+        userId: topics.userId,
+        title: topics.title,
+        status: topics.status,
+        agentId: topics.agentId,
+        agentTitle: agents.title,
+        agentName: agents.name,
+        agentAvatar: agents.avatar,
+        updatedAt: topics.updatedAt,
+        projectWorkingDirectoryId: topics.projectWorkingDirectoryId,
+      })
+      .from(topics)
+      .leftJoin(agents, and(eq(agents.id, topics.agentId), buildWorkspaceWhere(scope, agents)))
+      .where(
+        and(
+          eq(topics.projectId, projectId),
+          buildWorkspaceWhere(scope, topics),
+          isNull(topics.deletedAt),
+        ),
+      )
+      .orderBy(desc(topics.updatedAt));
   }
 }

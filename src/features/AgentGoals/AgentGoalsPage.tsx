@@ -1,26 +1,25 @@
 'use client';
 
-import { ActionIcon, Block, Empty, Flexbox, Text } from '@lobehub/ui';
-import { Button, Segmented } from '@lobehub/ui/base-ui';
+import { Block, Empty, Flexbox } from '@lobehub/ui';
+import { ActionIcon, Button, Segmented, Text } from '@lobehub/ui/base-ui';
 import { createStaticStyles, cssVar } from 'antd-style';
 import { LayoutGridIcon, ListIcon, PlusIcon, RefreshCwIcon } from 'lucide-react';
 import { memo, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 
-import NeuralNetworkLoading from '@/components/NeuralNetworkLoading';
+import GoalSkeleton, { GoalListRowsSkeleton } from '@/components/Skeleton/Goal';
 import AgentBreadcrumb from '@/features/AgentBreadcrumb';
 import NavHeader from '@/features/NavHeader';
 import WideScreenContainer from '@/features/WideScreenContainer';
-import { goalSelectors, useGoalStore } from '@/store/goal';
-import { useVerifyStore } from '@/store/verify';
+import { useWorkspaceAwareNavigate } from '@/features/Workspace/useWorkspaceAwareNavigate';
+import type { GoalListFilter } from '@/store/goal';
+import { useGoalStore } from '@/store/goal';
 
 import { createGoalModal } from './CreateGoalModal';
 import { GoalCardItem } from './GoalCardItem';
 import GoalEmptyState from './GoalEmptyState';
 import type { GoalExampleSeed } from './goalExamples';
 import { GoalListItem } from './GoalListItem';
-import { getGoalPresentation } from './goalPresentation';
-import { shouldShowGoal } from './goalViewModel';
 
 const styles = createStaticStyles(({ css }) => ({
   countBadge: css`
@@ -64,6 +63,28 @@ const styles = createStaticStyles(({ css }) => ({
   `,
 }));
 
+/**
+ * The list failed to load — the page's own read, or the selected tab's. Both
+ * carry the same retry, which revalidates every tab's entry at once.
+ */
+const GoalLoadError = ({ onRetry }: { onRetry: () => void }) => {
+  const { t } = useTranslation('chat');
+
+  return (
+    <Block padding={32} variant={'outlined'}>
+      <Flexbox align={'center'} gap={12}>
+        <Text weight={600}>{t('goalList.loadError')}</Text>
+        <Text fontSize={13} type={'secondary'}>
+          {t('goalList.loadErrorDescription')}
+        </Text>
+        <Button icon={RefreshCwIcon} onClick={onRetry}>
+          {t('goalList.retry')}
+        </Button>
+      </Flexbox>
+    </Block>
+  );
+};
+
 interface AgentGoalsPageProps {
   agentId?: string;
   projectId?: string;
@@ -71,44 +92,61 @@ interface AgentGoalsPageProps {
 
 const AgentGoalsPage = memo<AgentGoalsPageProps>(({ agentId, projectId }) => {
   const { t } = useTranslation('chat');
+  const navigate = useWorkspaceAwareNavigate();
   const scopeId = projectId ? `project:${projectId}` : agentId!;
   const useFetchGoals = useGoalStore((s) => s.useFetchGoals);
   const refreshGoals = useGoalStore((s) => s.refreshGoals);
-  const goals = useGoalStore(goalSelectors.goalList(scopeId));
-  const isInitialized = useGoalStore(goalSelectors.isGoalListInitialized(scopeId));
   const filter = useGoalStore((s) => s.goalListFilter);
   const viewMode = useGoalStore((s) => s.goalViewMode);
   const visibleLimit = useGoalStore((s) => s.goalListVisibleLimit);
   const setFilter = useGoalStore((s) => s.setGoalListFilter);
   const setViewMode = useGoalStore((s) => s.setGoalViewMode);
   const loadMoreGoals = useGoalStore((s) => s.loadMoreGoals);
-  const acceptanceBySubjectMap = useVerifyStore((s) => s.acceptanceBySubjectMap);
-  const acceptanceBundleMap = useVerifyStore((s) => s.acceptanceBundleMap);
-  const { error, isLoading } = useFetchGoals(agentId, projectId);
+  // Branch off the SWR response, not the store: the store sync (even via the
+  // sync wrapper) lands an effect after first paint, and a cache hit — which
+  // never fires a network callback — would render one empty-state frame in
+  // between. `data?.goals` keeps the settled-empty and hydrated shapes aligned.
+  const { data, error, isLoading } = useFetchGoals(agentId, projectId);
+  const goals = useMemo(() => data?.goals ?? [], [data]);
+  // The active tab reads its own statuses from the server. `all` shares the
+  // window read's cache entry, so the page only pays for an extra request once
+  // the user opens a narrow tab.
+  const tabSWR = useFetchGoals(agentId, projectId, filter);
+  // `delivered` is a whole-set count, not a count of the page the list happens
+  // to hold: read the review set's own total so the header can never disagree
+  // with what the Needs-review tab shows once a goal sits past the list's page.
+  const reviewSWR = useFetchGoals(agentId, projectId, 'review');
   const summary = useMemo(() => {
-    const delivered = goals.filter((goal) => goal.status === 'completed').length;
+    const total = data?.total ?? goals.length;
+    // An aggregate that has not answered is unknown, not zero. Falling back to
+    // the review goals visible in the list's page would understate it for
+    // exactly the accounts this page reads past one page, and present that
+    // partial count as the delivered total.
+    const delivered = reviewSWR.data?.total;
 
-    return { delivered, pursuing: goals.length - delivered, total: goals.length };
-  }, [goals]);
-  const filteredGoals = useMemo(() => {
-    if (filter === 'all') return goals;
-
-    return goals.filter((goal) => {
-      const acceptance = acceptanceBySubjectMap[`task:${goal.id}`];
-      const bundle = acceptance ? acceptanceBundleMap[acceptance.id] : undefined;
-      const config = goal.config as { goal?: { maxIterations?: number | null } } | null;
-      const presentation = getGoalPresentation({
-        acceptanceStatus: bundle?.acceptance.status,
-        checks: bundle?.checks,
-        maxRounds: config?.goal?.maxIterations,
-        rounds: goal.totalTopics ?? 0,
-        taskStatus: goal.status,
-      });
-
-      return shouldShowGoal(presentation.statusKey, 'active');
-    });
-  }, [acceptanceBundleMap, acceptanceBySubjectMap, filter, goals]);
-  const visibleGoalCount = filteredGoals.length;
+    return {
+      delivered,
+      pursuing: delivered === undefined ? undefined : total - delivered,
+      total,
+    };
+  }, [data, goals.length, reviewSWR.data]);
+  // A page of the newest goals cannot prove a tab empty, and neither can a read
+  // that failed: hold the list's shape while the tab's own read is in flight,
+  // and surface its failure rather than spinning on it.
+  const isTabUnresolved = filter !== 'all' && tabSWR.data === undefined;
+  const isTabPending = isTabUnresolved && !tabSWR.error;
+  const isTabError = isTabUnresolved && Boolean(tabSWR.error);
+  // The rows are the tab's own read, with no client-side fallback: a page of the
+  // newest goals cannot stand in for the tab's answer, and presenting it as if
+  // it could is what let a tab claim an outcome it had no way to know.
+  const filteredGoals = useMemo(
+    () => (filter === 'all' ? goals : (tabSWR.data?.goals ?? [])),
+    [filter, goals, tabSWR.data],
+  );
+  const isFilterEmpty = !isTabUnresolved && filteredGoals.length === 0;
+  // The tab's count is the server's answer for that tab. Until it arrives — or
+  // when it failed — the list's page cannot stand in for it either.
+  const visibleGoalCount = isTabUnresolved ? '—' : filteredGoals.length;
   const GoalItem = viewMode === 'list' ? GoalListItem : GoalCardItem;
   const openCreateGoal = (seed?: GoalExampleSeed) => {
     createGoalModal({
@@ -117,7 +155,14 @@ const AgentGoalsPage = memo<AgentGoalsPageProps>(({ agentId, projectId }) => {
       initialRoundBudget: seed?.roundBudget,
       initialTitle: seed?.title,
       projectId,
-      onCreated: () => void refreshGoals(scopeId),
+      // Land the user inside the goal right away: the detail page polls while
+      // the goal is still planning, so the exploration graph grows in place
+      // instead of the modal blocking on it.
+      onCreated: (goal) => {
+        void refreshGoals(scopeId);
+        const ownerId = goal.agentId ?? agentId;
+        navigate(ownerId ? `/agent/${ownerId}/goal/${goal.goalId}` : `/goal/${goal.goalId}`);
+      },
     });
   };
 
@@ -138,31 +183,17 @@ const AgentGoalsPage = memo<AgentGoalsPageProps>(({ agentId, projectId }) => {
         }
       />
       <WideScreenContainer
+        fullWidth
         flex={1}
         gap={16}
         paddingBlock={16}
+        paddingInline={16}
         wrapperStyle={{ flex: 1, overflowY: 'auto' }}
       >
-        {isLoading && !isInitialized ? (
-          <Flexbox align={'center'} flex={1} justify={'center'}>
-            <NeuralNetworkLoading />
-          </Flexbox>
+        {isLoading && data === undefined ? (
+          <GoalSkeleton chrome={'body'} />
         ) : error ? (
-          <Block padding={32} variant={'outlined'}>
-            <Flexbox align={'center'} gap={12}>
-              <Text weight={600}>{t('goalList.loadError')}</Text>
-              <Text fontSize={13} type={'secondary'}>
-                {t('goalList.loadErrorDescription')}
-              </Text>
-              <Button
-                icon={RefreshCwIcon}
-                size={'small'}
-                onClick={() => void refreshGoals(scopeId)}
-              >
-                {t('goalList.retry')}
-              </Button>
-            </Flexbox>
-          </Block>
+          <GoalLoadError onRetry={() => void refreshGoals(scopeId)} />
         ) : goals.length === 0 ? (
           <GoalEmptyState onCreate={openCreateGoal} />
         ) : (
@@ -186,7 +217,7 @@ const AgentGoalsPage = memo<AgentGoalsPageProps>(({ agentId, projectId }) => {
                   </Flexbox>
                   <Flexbox className={styles.metric} gap={2}>
                     <Text fontSize={20} weight={600}>
-                      {summary.pursuing}
+                      {summary.pursuing ?? '—'}
                     </Text>
                     <Text fontSize={12} type={'secondary'}>
                       {t('goalPage.metrics.pursuing')}
@@ -194,7 +225,7 @@ const AgentGoalsPage = memo<AgentGoalsPageProps>(({ agentId, projectId }) => {
                   </Flexbox>
                   <Flexbox className={styles.metric} gap={2}>
                     <Text fontSize={20} weight={600}>
-                      {summary.delivered}
+                      {summary.delivered ?? '—'}
                     </Text>
                     <Text fontSize={12} type={'secondary'}>
                       {t('goalPage.metrics.delivered')}
@@ -217,15 +248,23 @@ const AgentGoalsPage = memo<AgentGoalsPageProps>(({ agentId, projectId }) => {
                     value={filter}
                     options={[
                       {
-                        label: t('goalPage.filter.open'),
-                        value: 'active',
-                      },
-                      {
                         label: t('goalPage.filter.all'),
                         value: 'all',
                       },
+                      {
+                        label: t('goalPage.filter.review'),
+                        value: 'review',
+                      },
+                      {
+                        label: t('goalPage.filter.running'),
+                        value: 'running',
+                      },
+                      {
+                        label: t('goalPage.filter.achieved'),
+                        value: 'achieved',
+                      },
                     ]}
-                    onChange={(value) => setFilter(value as 'active' | 'all')}
+                    onChange={(value) => setFilter(value as GoalListFilter)}
                   />
                   <ActionIcon
                     icon={ListIcon}
@@ -246,7 +285,11 @@ const AgentGoalsPage = memo<AgentGoalsPageProps>(({ agentId, projectId }) => {
                 </Flexbox>
               </Flexbox>
               <div className={viewMode === 'card' ? styles.list : styles.listRows}>
-                {filteredGoals.length === 0 ? (
+                {isTabError ? (
+                  <GoalLoadError onRetry={() => void refreshGoals(scopeId)} />
+                ) : isTabPending ? (
+                  <GoalListRowsSkeleton />
+                ) : isFilterEmpty ? (
                   <Block padding={32} variant={'outlined'}>
                     <Empty
                       description={t('goalPage.filteredEmptyDescription')}
@@ -256,13 +299,8 @@ const AgentGoalsPage = memo<AgentGoalsPageProps>(({ agentId, projectId }) => {
                 ) : (
                   filteredGoals
                     .slice(0, visibleLimit)
-                    .map((goal) => (
-                      <GoalItem
-                        hideAchieved={filter === 'active'}
-                        key={goal.id}
-                        projectId={projectId}
-                        task={goal}
-                      />
+                    .map((item) => (
+                      <GoalItem goal={item} key={item.goal.id} projectId={projectId} />
                     ))
                 )}
               </div>

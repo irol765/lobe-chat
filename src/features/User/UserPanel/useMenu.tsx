@@ -1,7 +1,7 @@
 import { LOBE_CHAT_CLOUD, UTM_SOURCE } from '@lobechat/business-const';
-import { DOWNLOAD_URL, isDesktop } from '@lobechat/const';
-import { Flexbox, Hotkey, Icon, Tag } from '@lobehub/ui';
-import type { ItemType } from 'antd/es/menu/interface';
+import { isDesktop } from '@lobechat/const';
+import { Flexbox, Hotkey, Icon } from '@lobehub/ui';
+import { Tag } from '@lobehub/ui/base-ui';
 import { BrainCircuit, Cloudy, Download, HardDriveDownload, LogOut, Settings2 } from 'lucide-react';
 import type { PropsWithChildren } from 'react';
 import { memo } from 'react';
@@ -103,23 +103,23 @@ export const useMenu = () => {
         </a>
       ),
     },
-  ].filter(Boolean) as ItemType[];
+  ].filter(Boolean) as MenuProps['items'];
 
   const getApp: MenuProps['items'] = [
     {
       icon: <Icon icon={Download} />,
       key: 'get-app',
       label: (
-        <a href={DOWNLOAD_URL.default} rel="noopener noreferrer" target="_blank">
+        <WorkspaceLink escape to="/apps">
           {t('getApp')}
-        </a>
+        </WorkspaceLink>
       ),
     },
   ];
 
   const mainItems = [
     {
-      type: 'divider',
+      type: 'divider' as const,
     },
 
     ...(isLogin ? settings : []),
@@ -137,7 +137,7 @@ export const useMenu = () => {
         ]
       : []),
     ...(!hideDocs ? helps : []),
-    ...(!isDesktop ? getApp : []),
+    ...getApp,
   ]
     .filter(Boolean)
     // Remove consecutive dividers to prevent double divider lines

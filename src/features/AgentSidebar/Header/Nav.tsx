@@ -3,6 +3,7 @@
 import { Flexbox } from '@lobehub/ui';
 import { BotPromptIcon } from '@lobehub/ui/icons';
 import {
+  DnaIcon,
   ListTodoIcon,
   MessageSquarePlusIcon,
   MessagesSquareIcon,
@@ -31,6 +32,7 @@ import { labPreferSelectors } from '@/store/user/selectors';
 const Nav = memo(() => {
   const { t } = useTranslation('chat');
   const { t: tTopic } = useTranslation('topic');
+  const { t: tSelfLearning } = useTranslation('selfLearning');
   const params = useActiveRouteParams();
   const agentId = params.aid;
   const { pathname } = useActiveLocation();
@@ -42,6 +44,8 @@ const Nav = memo(() => {
     pathname.includes('/channel') ||
     pathname.endsWith('/statistics');
   const isGoalsActive = pathname.endsWith('/goals');
+  // 下钻页 /self-evolving/:domainId 也算在这个入口下，否则点进去侧边栏就失焦了
+  const isSelfLearningActive = pathname.includes('/self-evolving');
   const isTasksActive = pathname.endsWith('/tasks') || pathname.includes('/task/');
   // Topic IDs are prefixed `topics_`, so /agent/:aid/topics_abc would also match
   // pathname.includes('/topics') — anchor to end to avoid that false positive.
@@ -56,7 +60,8 @@ const Nav = memo(() => {
   const switchTopic = useChatStore((s) => s.switchTopic);
   const [openNewTopicOrSaveTopic] = useChatStore((s) => [s.openNewTopicOrSaveTopic]);
   const isNewTopicSendInFlight = useChatStore(topicSelectors.isNewTopicSendInFlight);
-  const enableTopicAcceptance = useUserStore(labPreferSelectors.enableTopicAcceptance);
+  const enableGoals = useUserStore(labPreferSelectors.enableGoals);
+  const enableSelfLearning = useUserStore(labPreferSelectors.enableSelfLearning);
 
   const { mutate } = useActionSWR(topicActionKeys.openNewOrSave(), openNewTopicOrSaveTopic);
   const handleNewTopic = () => {
@@ -105,7 +110,18 @@ const Nav = memo(() => {
           }}
         />
       )}
-      {enableTopicAcceptance && (
+      {enableSelfLearning && (
+        <NavItem
+          active={isSelfLearningActive}
+          icon={DnaIcon}
+          title={tSelfLearning('title')}
+          onClick={() => {
+            switchTopic(null, { skipRefreshMessage: true });
+            router.push(urlJoin('/agent', agentId!, 'self-evolving'));
+          }}
+        />
+      )}
+      {enableGoals && (
         <NavItem
           active={isGoalsActive}
           icon={TargetIcon}

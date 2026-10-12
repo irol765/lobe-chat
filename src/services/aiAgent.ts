@@ -1,15 +1,37 @@
+import type { AgentStreamClientFeature } from '@lobechat/agent-gateway-client';
+import { CLIENT_PROTOCOL_VERSION } from '@lobechat/agent-gateway-client';
 import type {
+  ClientLlmWaitItem,
   ExecAgentAppContext,
+  ExecAgentLlmExecutor,
   ExecAgentResult,
+  ResumeClientLlmWaitResult,
   RuntimeMentionedAgent,
   ScheduleAgentRunParams,
   ScheduleAgentRunResult,
   UserInterventionConfig,
 } from '@lobechat/types';
 
+import { canUseGatewayProtocolV2 } from '@/helpers/gatewayProtocol';
 import { lambdaClient } from '@/libs/trpc/client';
+import { buildLlmExecutorDeclaration } from '@/services/llmRelay';
 
 export type { ExecAgentResult, ScheduleAgentRunParams, ScheduleAgentRunResult };
+
+/** Gateway stream features every run started from this client handles. */
+const STREAM_FEATURES: AgentStreamClientFeature[] = ['member_runtime_end'];
+
+/** An older server's strict input schema rejected the `streamFeatures` key. */
+const isUnknownStreamFeaturesError = (error: unknown): boolean => {
+  const { data, message } = (error ?? {}) as { data?: { code?: string }; message?: unknown };
+
+  return (
+    data?.code === 'BAD_REQUEST' &&
+    typeof message === 'string' &&
+    message.includes('unrecognized_keys') &&
+    message.includes('streamFeatures')
+  );
+};
 
 /**
  * Resume instruction for an operation that hit `human_approve_required`. When
@@ -45,12 +67,65 @@ export interface ResumeApprovalParam {
 export interface ResumeToolResultParam {
   /** The human-provided tool result (the answer text). */
   content: string;
+  /** Distinguishes a submitted form from an explicit skip. */
+  outcome?: 'skipped' | 'submitted';
   /** ID of the pending `role='tool'` message this result targets. */
   parentMessageId: string;
   /** Optional plugin state to persist on the tool message. */
   pluginState?: Record<string, unknown>;
+  /** Optional user-supplied reason for a skipped interaction. */
+  rejectionReason?: string;
   /** tool_call_id of the pending tool call being answered. */
   toolCallId: string;
+}
+
+export type AgentInterventionSourceAction =
+  | { optionId: string; type: 'select_provider_option' }
+  | {
+      edits?: Record<string, Record<string, unknown>>;
+      scope: 'once' | 'remember';
+      type: 'approve_tool';
+    }
+  | { reason?: string; type: 'reject_continue' }
+  | { scope: 'operation'; type: 'stop' }
+  | { result: Record<string, string | string[]>; type: 'submit_answers' }
+  | {
+      result: { kind: 'agent_marketplace'; selectedTemplateIds: string[] };
+      type: 'submit_custom';
+    }
+  | { type: 'skip_interaction' }
+  | { type: 'cancel_interaction' };
+
+export interface ResolveAgentInterventionBySourceParams {
+  action: AgentInterventionSourceAction;
+  batchId: string;
+  operationId: string;
+  resolutionRequestId: string;
+  targets: Array<{ toolCallId: string; toolMessageId: string }>;
+}
+
+export type ResolveAgentInterventionBySourceResult =
+  | { execution?: never; handled: false; state?: never }
+  | {
+      execution?: ExecAgentResult;
+      handled: true;
+      state: 'already_resolved' | 'claimed';
+    };
+
+export interface GetAgentInterventionReviewBySourceParams {
+  batchId: string;
+  operationId: string;
+  targets: Array<{ toolCallId: string; toolMessageId: string }>;
+}
+
+/** Must not exceed the server's `ExecAgentSchema.clientOperations` bound. */
+export const MAX_CLIENT_OPERATION_SNAPSHOT = 10;
+
+export interface ClientOperationSnapshot {
+  isAborting?: boolean;
+  operationId: string;
+  status: string;
+  visibleLoadingDone?: boolean;
 }
 
 export interface ExecAgentTaskParams {
@@ -64,6 +139,12 @@ export interface ExecAgentTaskParams {
    * sends only; resume / regeneration must not replay them.
    */
   clientIds?: { assistantMessageId?: string; topicId?: string; userMessageId?: string };
+  /**
+   * Server runs the composer tracked on this conversation at send time. The
+   * server records them only when this send has to stop a run the client left
+   * live, to tell whether the client never saw it or its stop never landed.
+   */
+  clientOperations?: ClientOperationSnapshot[];
   deviceId?: string;
   existingMessageIds?: string[];
   /** File IDs of already-uploaded attachments to attach to the new user message */
@@ -93,6 +174,8 @@ export interface ExecAgentTaskParams {
   /** Tool identifiers the user @-mentioned in this message; the server enables them for this run. */
   selectedToolIds?: string[];
   slug?: string;
+  /** The prompt was queued behind a running turn and renders as its continuation. */
+  steer?: boolean;
   /**
    * Override what initiated this operation. Server defaults to `'chat'` when
    * omitted. Pass a more specific value (`'cli'`, `'openapi'`, …) so the
@@ -184,6 +267,10 @@ export interface UpdateClientTaskThreadStatusParams {
 }
 
 class AiAgentService {
+  async getServerDefaultHeterogeneousCapability() {
+    return await lambdaClient.aiAgent.getServerDefaultHeterogeneousCapability.query();
+  }
+
   /**
    * Execute a single Agent task.
    * Returns the operationId needed to connect to the Agent Gateway.
@@ -192,7 +279,26 @@ class AiAgentService {
     params: ExecAgentTaskParams,
     options?: { signal?: AbortSignal },
   ): Promise<ExecAgentResult> {
-    return await lambdaClient.aiAgent.execAgent.mutate(params, options);
+    // Ask for protocol-v2 delivery — message revisions instead of whole message
+    // snapshots — when this client both understands it and is inside the
+    // rollout. Anything else stays on the pushed snapshots, which is what an
+    // older bundle needs to render the run at all. A caller may still pin it
+    // (a replay harness asserting v1 delivery).
+    const clientProtocol = canUseGatewayProtocolV2() ? CLIENT_PROTOCOL_VERSION : undefined;
+    // Inside the `agent_llm_relay` rollout this tab offers to run the LLM calls
+    // of providers only this device can reach (a local Ollama, a private
+    // endpoint); the server hands them over as `llm_execute`.
+    const llmExecutor = buildLlmExecutorDeclaration();
+
+    return await lambdaClient.aiAgent.execAgent.mutate(
+      {
+        clientProtocol,
+        ...(llmExecutor && { llmExecutor }),
+        ...params,
+        streamFeatures: STREAM_FEATURES,
+      },
+      options,
+    );
   }
 
   /**
@@ -216,6 +322,15 @@ class AiAgentService {
     return await lambdaClient.aiAgent.refreshGatewayToken.query({ topicId });
   }
 
+  /**
+   * Mint the per-user JWT for the multiplexed Gateway WebSocket (v2, one
+   * socket per user). Not bound to any operation — the mux client calls this
+   * before every connect attempt.
+   */
+  async issueGatewayUserToken(): Promise<{ token: string }> {
+    return await lambdaClient.aiAgent.issueGatewayUserToken.query();
+  }
+
   async execSubAgentTask(params: ExecSubAgentTaskParams) {
     return await lambdaClient.aiAgent.execSubAgentTask.mutate(params);
   }
@@ -235,6 +350,30 @@ class AiAgentService {
     return await lambdaClient.aiAgent.interruptTask.mutate(params);
   }
 
+  /** Runs parked in `waiting_for_client`, waiting for a client to run their LLM call. */
+  /** Runs parked for a client, narrowed to `providers` (the ones this client can run). */
+  async listClientLlmWaits(providers?: string[]): Promise<ClientLlmWaitItem[]> {
+    return await lambdaClient.aiAgent.listClientLlmWaits.query(
+      providers ? { providers } : undefined,
+    );
+  }
+
+  /** Continue a run parked in `waiting_for_client`, with this client as its executor. */
+  async resumeClientLlmWait(params: {
+    llmExecutor: ExecAgentLlmExecutor;
+    operationId: string;
+  }): Promise<ResumeClientLlmWaitResult> {
+    return await lambdaClient.aiAgent.resumeClientLlmWait.mutate(params);
+  }
+
+  /**
+   * Tell a running server operation whether user messages are queued behind it,
+   * so it hands the turn back at its next step boundary.
+   */
+  async setQueuedMessages(params: { operationId: string; pending: boolean }) {
+    return await lambdaClient.aiAgent.setQueuedMessages.mutate(params);
+  }
+
   /**
    * Stop a run parked on tool approval: settle the pending tool rows and end
    * the operation without running anything or continuing the model.
@@ -242,8 +381,49 @@ class AiAgentService {
    * Not `interruptTask` — that one assumes a live loop will persist the
    * outcome, which a parked run does not have.
    */
-  async stopPendingApproval(params: { toolMessageIds: string[]; topicId: string }) {
+  async stopPendingApproval(params: {
+    batchId: string;
+    operationId: string;
+    toolMessageIds: string[];
+    topicId: string;
+  }) {
     return await lambdaClient.aiAgent.stopPendingApproval.mutate(params);
+  }
+
+  /**
+   * Try the Cloud durable first-winner path for an active Web card. A false
+   * result means this deployment has no generic intervention store and the
+   * caller should use the legacy OSS Gateway resume path.
+   */
+  async resolveAgentInterventionBySource(
+    params: ResolveAgentInterventionBySourceParams,
+  ): Promise<ResolveAgentInterventionBySourceResult> {
+    const mutate = lambdaClient.aiAgent.resolveAgentInterventionBySource.mutate;
+    let result: Awaited<ReturnType<typeof mutate>>;
+    try {
+      // This client subscribes to the continuation it starts.
+      result = await mutate({ ...params, streamFeatures: STREAM_FEATURES });
+    } catch (error) {
+      // A server from before `streamFeatures` validates this input strictly and
+      // rejects the unknown key before claiming anything, so resending the same
+      // resolution without it is safe. That server never renames a mirrored
+      // member terminal, so dropping the declaration loses nothing.
+      if (!isUnknownStreamFeaturesError(error)) throw error;
+      result = await mutate(params);
+    }
+
+    if (!result.success) return { handled: false };
+
+    return {
+      execution: 'execution' in result ? result.execution : undefined,
+      handled: true,
+      state: result.state,
+    };
+  }
+
+  /** Fetch the authoritative v2 snapshot and view/resolve authorization for an active card. */
+  async getAgentInterventionReviewBySource(params: GetAgentInterventionReviewBySourceParams) {
+    return await lambdaClient.aiAgent.getAgentInterventionReviewBySource.mutate(params);
   }
 
   /**

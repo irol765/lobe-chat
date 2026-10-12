@@ -108,11 +108,15 @@ const taskListViewOptions = (s: GlobalState) =>
   s.status.taskListViewOptions || {
     groupBy: 'status',
     hideCompleted: true,
+    nestedSubTasks: true,
     orderBy: 'updatedAt',
     orderCompletedByRecency: true,
     orderDirection: 'asc',
+    showSubTasks: false,
     subGroupBy: 'none',
   };
+
+const taskListViewMode = (s: GlobalState) => s.status.taskListViewMode ?? 'list';
 
 // Default the inline composer to collapsed so a populated task list keeps the
 // records at the top of the fold; the empty-state hero still shows the full
@@ -401,8 +405,9 @@ const modelDetailPanelExpandedKeys = (s: GlobalState): ModelDetailPanelExpandedK
 
   return MODEL_DETAIL_PANEL_EXPANDABLE_KEYS.filter((key) => !collapsedKeys.includes(key));
 };
-const modelSwitchPanelGroupMode = (s: GlobalState) =>
-  s.status.modelSwitchPanelGroupMode || 'byProvider';
+// Reads only the user-written key; the legacy `modelSwitchPanelGroupMode`
+// was seeded into persisted status and must not influence the default.
+const modelSwitchPanelGroupMode = (s: GlobalState) => s.status.modelSwitchPanelGroupBy || 'byModel';
 const modelSwitchPanelWidth = (s: GlobalState) => s.status.modelSwitchPanelWidth || 460;
 const pageAgentPanelWidth = (s: GlobalState) => s.status.pageAgentPanelWidth || 360;
 const workingSidebarWidth = (s: GlobalState) => s.status.workingSidebarWidth || 360;
@@ -506,6 +511,7 @@ export const systemStatusSelectors = {
   taskCreateInlineCollapsed,
   taskKanbanHiddenColumns,
   taskKanbanHiddenPanelCollapsed,
+  taskListViewMode,
   taskListViewOptions,
   sidebarExpandedKeys,
   agentSidebarSections,

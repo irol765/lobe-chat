@@ -1,7 +1,6 @@
 import { type MenuProps } from '@lobehub/ui';
 import { Icon } from '@lobehub/ui';
-import { confirmModal, toast } from '@lobehub/ui/base-ui';
-import { App, Upload } from 'antd';
+import { confirmModal, toast, Upload } from '@lobehub/ui/base-ui';
 import { css, cx } from 'antd-style';
 import { Archive, Hash, Import, LucideCheck, Trash } from 'lucide-react';
 import { useCallback, useMemo } from 'react';
@@ -37,7 +36,6 @@ export const useTopicActionsDropdownMenu = (
   options: UseTopicActionsDropdownMenuOptions = {},
 ): MenuProps['items'] => {
   const { t } = useTranslation(['topic', 'common']);
-  const { modal } = App.useApp();
   const { onUploadClose } = options;
   const activeWorkspaceId = useActiveWorkspaceId();
   const isWorkspaceOwner = useIsWorkspaceOwner();
@@ -115,14 +113,13 @@ export const useTopicActionsDropdownMenu = (
         JSON.parse(text);
         await importTopic(text);
       } catch {
-        modal.error({
-          content: t('importInvalidFormat'),
+        toast.error({
+          description: t('importInvalidFormat'),
           title: t('importError'),
         });
       }
-      return false; // Prevent default upload behavior
     },
-    [importTopic, modal, onUploadClose, t],
+    [importTopic, onUploadClose, t],
   );
 
   const [topicPageSize, updateSystemStatus] = useGlobalStore((s) => [
@@ -159,9 +156,8 @@ export const useTopicActionsDropdownMenu = (
         label: (
           <Upload
             accept=".json"
-            beforeUpload={handleImport}
             disabled={!canCreateTopic}
-            showUploadList={false}
+            onFiles={([file]) => handleImport(file)}
           >
             <div className={cx(hotArea)}>{t('actions.import')}</div>
           </Upload>
@@ -182,45 +178,6 @@ export const useTopicActionsDropdownMenu = (
         ),
         onClick: () => handleArchiveMergedPullRequests('own'),
       },
-      {
-        disabled: !canEditTopic,
-        icon: <Icon icon={Trash} />,
-        key: 'deleteUnstarred',
-        label: t(activeWorkspaceId ? 'actions.removeUnstarredOwn' : 'actions.removeUnstarred'),
-        onClick: () => {
-          confirmModal({
-            cancelText: t('cancel', { ns: 'common' }),
-            content: t(
-              activeWorkspaceId
-                ? 'actions.confirmRemoveUnstarredOwn'
-                : 'actions.confirmRemoveUnstarred',
-            ),
-            okButtonProps: { danger: true },
-            okText: t('ok', { ns: 'common' }),
-            onOk: () => removeUnstarredTopic({ onlyOwn: !!activeWorkspaceId }),
-            title: t(activeWorkspaceId ? 'actions.removeUnstarredOwn' : 'actions.removeUnstarred'),
-          });
-        },
-      },
-      {
-        danger: true,
-        disabled: !canEditTopic,
-        icon: <Icon icon={Trash} />,
-        key: 'deleteAll',
-        label: t(activeWorkspaceId ? 'actions.removeAllOwn' : 'actions.removeAll'),
-        onClick: () => {
-          confirmModal({
-            cancelText: t('cancel', { ns: 'common' }),
-            content: t(
-              activeWorkspaceId ? 'actions.confirmRemoveAllOwn' : 'actions.confirmRemoveAll',
-            ),
-            okButtonProps: { danger: true },
-            okText: t('ok', { ns: 'common' }),
-            onOk: () => removeAllTopic('own'),
-            title: t(activeWorkspaceId ? 'actions.removeAllOwn' : 'actions.removeAll'),
-          });
-        },
-      },
       ...(activeWorkspaceId && isWorkspaceOwner
         ? [
             { type: 'divider' as const },
@@ -234,7 +191,8 @@ export const useTopicActionsDropdownMenu = (
                   cancelText: t('cancel', { ns: 'common' }),
                   okText: t('ok', { ns: 'common' }),
                   onOk: () => handleArchiveMergedPullRequests('workspace'),
-                  title: t('actions.confirmArchiveMergedPullRequestsWorkspace'),
+                  content: t('actions.confirmArchiveMergedPullRequestsWorkspace'),
+                  title: t('actions.archiveMergedPullRequestsWorkspace'),
                 });
               },
             },

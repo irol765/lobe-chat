@@ -1,5 +1,5 @@
-import { ActionIcon, Flexbox, Highlighter, Text } from '@lobehub/ui';
-import { Divider } from 'antd';
+import { Flexbox, Highlighter } from '@lobehub/ui';
+import { ActionIcon, Divider, Text } from '@lobehub/ui/base-ui';
 import { cssVar, cx } from 'antd-style';
 import { WrapText } from 'lucide-react';
 import { parse } from 'partial-json';

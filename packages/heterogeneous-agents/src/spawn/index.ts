@@ -27,6 +27,15 @@ export {
 } from '../codex';
 export type { UsageData } from '../types';
 export {
+  ACP_PROTOCOL_VERSION,
+  AcpAgentSession,
+  type AcpAgentSessionConfig,
+  type AcpAgentSessionOptions,
+  type AcpPermissionOption,
+  parseAcpPermissionOptions,
+  selectAcpPermissionOption,
+} from './acpAgentSession';
+export {
   type AcpRpcErrorData,
   type AcpRpcMessage,
   AcpRpcResponseError,
@@ -66,6 +75,39 @@ export {
   resolveCodexInitialModel,
 } from './codexModel';
 export {
+  buildCursorAcpArgs,
+  buildCursorAcpPrompt,
+  CursorAcpSession,
+  type CursorAcpSessionOptions,
+  type CursorAcpTextPromptBlock,
+  isCursorAcpSessionNotFoundError,
+  normalizeCursorQuestion,
+} from './cursorAcpSession';
+export {
+  buildDevinAcpArgs,
+  buildDevinAcpPrompt,
+  type DevinAcpImagePromptBlock,
+  type DevinAcpPromptBlock,
+  DevinAcpSession,
+  type DevinAcpSessionOptions,
+  type DevinAcpTextPromptBlock,
+  isDevinAcpSessionNotFoundError,
+} from './devinAcpSession';
+export {
+  buildDroidAcpArgs,
+  buildDroidAcpPrompt,
+  type DroidAcpImagePromptBlock,
+  type DroidAcpModelCatalog,
+  type DroidAcpPromptBlock,
+  DroidAcpSession,
+  type DroidAcpSessionOptions,
+  type DroidAcpTextPromptBlock,
+  isDroidAcpSessionNotFoundError,
+  listDroidAcpModels,
+  type ListDroidAcpModelsOptions,
+  parseDroidAcpModelCatalog,
+} from './droidAcpSession';
+export {
   createFileStoreImageUploader,
   type FileStoreCreateFileInput,
   type FileStorePort,
@@ -101,6 +143,14 @@ export { JsonlStreamProcessor } from './jsonlProcessor';
 // import time. Import it from the dedicated `@lobechat/heterogeneous-agents/
 // resolveCliCommand` subpath instead.
 export {
+  buildClaudeCodeDirectEnv,
+  type BuildClaudeCodeDirectEnvInput,
+  type BuildClaudeCodeDirectEnvResult,
+  normalizeAnthropicSdkBaseURL,
+  sanitizeClaudeCodeDirectArgs,
+  sanitizeClaudeCodeDirectEnv,
+} from './claudeCodeDirectEnv';
+export {
   ensureClaudeCodeResumeTranscript,
   type EnsureResumeTranscriptReason,
   type EnsureResumeTranscriptResult,
@@ -115,10 +165,8 @@ export {
   CODEX_DEFAULT_EXECUTION_ARGS,
   CODEX_EXECUTION_MODE_FLAGS,
   CODEX_REQUIRED_ARGS,
-  CURSOR_BASE_ARGS,
   KIMI_CODE_BASE_ARGS,
   OPENCODE_BASE_ARGS,
-  PI_BASE_ARGS,
   QODER_BASE_ARGS,
   type QoderSpawnArgsOptions,
   spawnAgent,

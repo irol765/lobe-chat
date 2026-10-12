@@ -22,13 +22,17 @@ const ProjectHeader = memo<ProjectHeaderProps>(({ project }) => {
   const { t } = useTranslation(['project', 'common']);
   const navigate = useWorkspaceAwareNavigate();
   const projects = useCurrentProjectList();
-  const { error, isLoading, mutate } = useProjectStore((s) => s.useFetchProjectList)(true);
+  const { error, isHydrated, isValidating, revalidate } = useProjectStore(
+    (s) => s.useFetchProjectList,
+  )(true);
+  // Rows come from the store; the hook only reports fetch progress.
+  const isLoading = !isHydrated || isValidating;
 
   const items = useMemo<SwitcherItem[]>(
     () =>
       projects.map((item) => ({
         avatar: item.avatar || item.name,
-        id: item.id,
+        id: item.slug ?? item.id,
         private: item.visibility === 'private',
         title: item.name,
       })),
@@ -36,7 +40,7 @@ const ProjectHeader = memo<ProjectHeaderProps>(({ project }) => {
   );
 
   const handleSelect = useCallback(
-    (projectId: string) => navigate(`/project/${projectId}`),
+    (projectSlug: string) => navigate(`/project/${projectSlug}`),
     [navigate],
   );
 
@@ -47,19 +51,20 @@ const ProjectHeader = memo<ProjectHeaderProps>(({ project }) => {
         <SidebarHeaderSelectPopover
           content={
             <SwitcherMenu
-              activeId={project?.id}
-              error={error}
+              activeId={project?.slug ?? project?.id}
+              error={items.length === 0 ? error : undefined}
               isLoading={isLoading && items.length === 0}
               items={items}
               kind={'project'}
               searchPlaceholder={t('navPanel.searchProject', { ns: 'common' })}
-              onRetry={() => mutate()}
+              onRetry={() => revalidate()}
               onSelect={handleSelect}
             />
           }
         >
           <SidebarHeaderSelectTrigger
             avatar={project?.avatar || project?.name || t('sidebar.title')}
+            name={project?.name || t('sidebar.title')}
             title={project?.name || t('sidebar.title')}
           />
         </SidebarHeaderSelectPopover>

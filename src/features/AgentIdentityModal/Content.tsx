@@ -1,8 +1,8 @@
 'use client';
 
 import { randomAgentName } from '@lobechat/const';
-import { ActionIcon, Flexbox, Input, Text } from '@lobehub/ui';
-import { Button, useModalContext } from '@lobehub/ui/base-ui';
+import { Flexbox } from '@lobehub/ui';
+import { ActionIcon, Button, Input, Text, useModalContext } from '@lobehub/ui/base-ui';
 import { cssVar } from 'antd-style';
 import { DicesIcon } from 'lucide-react';
 import { memo, type ReactNode, useCallback } from 'react';
@@ -115,9 +115,10 @@ const AgentIdentityContent = memo<AgentIdentityContentProps>(({ agentId }) => {
           }
         >
           <Input
+            aria-invalid={!!form.error}
+            data-invalid={form.error ? '' : undefined}
             placeholder={t('settingAgent.slug.placeholder', { ns: 'setting' })}
             prefix={'@'}
-            status={form.error ? 'error' : undefined}
             value={form.slug}
             onChange={(e) => form.setSlug(e.target.value)}
           />

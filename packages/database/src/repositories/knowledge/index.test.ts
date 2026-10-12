@@ -3,6 +3,7 @@ import { FileSource, FilesTabs, ResourceSourceFilter } from '@lobechat/types';
 import { beforeEach, describe, expect, it } from 'vitest';
 
 import { getTestDB } from '../../core/getTestDB';
+import { FileModel } from '../../models/file';
 import type { NewDocument, NewFile } from '../../schemas/file';
 import { documents, files, knowledgeBaseFiles, knowledgeBases } from '../../schemas/file';
 import { chunks, embeddings } from '../../schemas/rag';
@@ -424,6 +425,50 @@ describe('KnowledgeRepo', () => {
       expect(names).toContain('public-doc.pdf');
       expect(names).not.toContain('other-private-doc.pdf');
     });
+
+    it('should separate recent pages and files by the Resources visibility mode', async () => {
+      await serverDB.insert(files).values([
+        {
+          fileType: 'text/plain',
+          name: 'public-file.txt',
+          size: 100,
+          url: 'public-file-url',
+          userId,
+          visibility: 'public',
+          workspaceId,
+        },
+        {
+          fileType: 'text/plain',
+          name: 'caller-private-file.txt',
+          size: 100,
+          url: 'caller-private-file-url',
+          userId,
+          visibility: 'private',
+          workspaceId,
+        },
+        {
+          fileType: 'text/plain',
+          name: 'other-private-file.txt',
+          size: 100,
+          url: 'other-private-file-url',
+          userId: otherUserId,
+          visibility: 'private',
+          workspaceId,
+        },
+      ]);
+
+      const repo = new KnowledgeRepo(serverDB, userId, workspaceId);
+
+      const privatePages = await repo.queryRecent(10, 'page', 'private');
+      const publicPages = await repo.queryRecent(10, 'page', 'public');
+      const privateFiles = await repo.queryRecent(10, 'file', 'private');
+      const publicFiles = await repo.queryRecent(10, 'file', 'public');
+
+      expect(privatePages.map((item) => item.name)).toEqual(['caller-private-doc.pdf']);
+      expect(publicPages.map((item) => item.name)).toEqual(['public-doc.pdf']);
+      expect(privateFiles.map((item) => item.name)).toEqual(['caller-private-file.txt']);
+      expect(publicFiles.map((item) => item.name)).toEqual(['public-file.txt']);
+    });
   });
 
   describe('query - search filtering', () => {
@@ -719,6 +764,14 @@ describe('KnowledgeRepo', () => {
 
       const otherUserItem = results.find((item) => item.name === 'other-recent.pdf');
       expect(otherUserItem).toBeUndefined();
+    });
+
+    it('should ignore Resources visibility narrowing in personal mode', async () => {
+      const privateMode = await knowledgeRepo.queryRecent(10, 'file', 'private');
+      const publicMode = await knowledgeRepo.queryRecent(10, 'file', 'public');
+
+      expect(privateMode.map((item) => item.name)).toEqual(['recent-1.pdf', 'recent-2.pdf']);
+      expect(publicMode.map((item) => item.name)).toEqual(['recent-1.pdf', 'recent-2.pdf']);
     });
 
     it('should still return pages when newer files would fill the limit', async () => {
@@ -1305,7 +1358,7 @@ describe('KnowledgeRepo', () => {
     });
   });
 
-  describe('acceptance evidence hiding', () => {
+  describe('non-library file hiding', () => {
     beforeEach(async () => {
       await serverDB.insert(files).values([
         {
@@ -1323,6 +1376,15 @@ describe('KnowledgeRepo', () => {
           size: 100,
           source: FileSource.Acceptance,
           url: 'evidence-url',
+          userId,
+        },
+        {
+          id: 'agent-share-file',
+          fileType: 'text/plain',
+          metadata: { agentShare: { shareId: 'share-a', visitorUserId: 'visitor-a' } },
+          name: 'visitor.txt',
+          size: 100,
+          url: 'visitor-url',
           userId,
         },
         {
@@ -1344,18 +1406,133 @@ describe('KnowledgeRepo', () => {
       expect(ids).toContain('library-file');
       expect(ids).toContain('generated-file');
       expect(ids).not.toContain('evidence-file');
+      expect(ids).not.toContain('agent-share-file');
     });
 
     it('should hide acceptance evidence from recent items', async () => {
       const result = await knowledgeRepo.queryRecent(50, 'file');
 
       expect(result.map((item) => item.fileId)).not.toContain('evidence-file');
+      expect(result.map((item) => item.fileId)).not.toContain('agent-share-file');
     });
 
     it('should still resolve acceptance evidence by id', async () => {
       const result = await knowledgeRepo.findById('evidence-file', 'file');
 
       expect(result?.name).toBe('payload-execution.txt');
+    });
+
+    it('should not resolve an agent-share file through the ordinary resource API', async () => {
+      await expect(knowledgeRepo.findById('agent-share-file', 'file')).resolves.toBeUndefined();
+    });
+  });
+
+  /** @example Agent uploads are shared attachments without becoming library entries. */
+  describe('agent-document uploads', () => {
+    const workspaceId = 'agent-upload-workspace';
+    const agentFileId = 'agent-upload-file';
+    const libraryFileId = 'regular-upload-file';
+    const knowledgeBaseId = 'agent-upload-kb';
+
+    beforeEach(async () => {
+      await serverDB.insert(workspaces).values({
+        id: workspaceId,
+        name: 'Agent upload workspace',
+        primaryOwnerId: userId,
+        slug: workspaceId,
+      });
+      await serverDB.insert(knowledgeBases).values({
+        id: knowledgeBaseId,
+        name: 'Reference library',
+        userId,
+        workspaceId,
+      });
+      await serverDB.insert(files).values([
+        {
+          id: agentFileId,
+          fileType: 'application/pdf',
+          name: 'agent-brief.pdf',
+          size: 100,
+          source: FileSource.AgentDocument,
+          url: 'files/agent-brief.pdf',
+          userId,
+          visibility: 'public',
+          workspaceId,
+        },
+        {
+          id: libraryFileId,
+          fileType: 'application/pdf',
+          name: 'library-brief.pdf',
+          size: 100,
+          url: 'files/library-brief.pdf',
+          userId,
+          visibility: 'public',
+          workspaceId,
+        },
+      ]);
+      await serverDB.insert(documents).values({
+        fileId: agentFileId,
+        fileType: 'application/pdf',
+        filename: 'agent-brief.pdf',
+        source: 'files/agent-brief.pdf',
+        sourceType: 'file',
+        totalCharCount: 0,
+        totalLineCount: 0,
+        userId,
+        visibility: 'public',
+        workspaceId,
+      });
+    });
+
+    /** @example A shared agent PDF stays out of Resources, including filtered and recent lists. */
+    it('hides agent uploads while retaining ordinary files with the same MIME type', async () => {
+      // ROOT CAUSE:
+      // Making backing uploads public fixes previews but exposes them in resource lists
+      // unless their origin is excluded. Filtering MIME types would also hide ordinary PDFs.
+      // Reuse the hidden-source predicate for every list instead of changing the file type.
+      const repo = new KnowledgeRepo(serverDB, otherUserId, workspaceId);
+      const resources = await repo.query({ category: FilesTabs.Documents });
+      const uploads = await repo.query({ sourceFilter: ResourceSourceFilter.Uploaded });
+      const recent = await repo.queryRecent(50, 'file');
+      const directList = await new FileModel(serverDB, otherUserId, workspaceId).query({});
+
+      /** @example Each list includes the ordinary PDF and excludes the agent's PDF. */
+      expect([resources, uploads, recent].map((rows) => rows.map((row) => row.fileId))).toEqual([
+        [libraryFileId],
+        [libraryFileId],
+        [libraryFileId],
+      ]);
+      /** @example File-model lists apply the same exclusion as the Resources repository. */
+      expect(directList.map((row) => row.id)).toEqual([libraryFileId]);
+    });
+
+    /** @example A knowledge-base listing cannot reintroduce an agent-only attachment. */
+    it('excludes agent uploads from knowledge-base listings', async () => {
+      await serverDB.insert(knowledgeBaseFiles).values([
+        { fileId: agentFileId, knowledgeBaseId, userId },
+        { fileId: libraryFileId, knowledgeBaseId, userId },
+      ]);
+      const repo = new KnowledgeRepo(serverDB, otherUserId, workspaceId);
+
+      /** @example Only the ordinary resource is listed, even when both have a KB relation. */
+      expect((await repo.query({ knowledgeBaseId })).map((row) => row.fileId)).toEqual([
+        libraryFileId,
+      ]);
+    });
+
+    /** @example Hidden-from-library files remain directly readable inside their workspace. */
+    it('allows a second workspace user to read the file without exposing it in personal mode', async () => {
+      const workspaceFiles = new FileModel(serverDB, otherUserId, workspaceId);
+      const personalFiles = new FileModel(serverDB, otherUserId);
+
+      /** @example Another member can fetch metadata for the agent file preview. */
+      expect(await workspaceFiles.findById(agentFileId)).toMatchObject({
+        id: agentFileId,
+        source: FileSource.AgentDocument,
+        visibility: 'public',
+      });
+      /** @example Public workspace visibility does not remove workspace isolation. */
+      expect(await personalFiles.findById(agentFileId)).toBeUndefined();
     });
   });
 

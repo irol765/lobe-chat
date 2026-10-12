@@ -28,6 +28,7 @@ import { and, asc, cosineDistance, desc, eq, inArray, isNotNull, ne, or, sql } f
 
 import { merge } from '@/utils/merge';
 
+import type { FtsSearchCandidateSource } from '../../repositories/ftsSearch';
 import type {
   UserMemoryActivitiesWithoutVectors,
   UserMemoryActivity,
@@ -48,9 +49,11 @@ import {
 import type { LobeChatDatabase } from '../../type';
 import { normalizeBm25MatchQuery, SAFE_BM25_QUERY_OPTIONS } from '../../utils/bm25';
 import { selectNonVectorColumns } from '../../utils/columns';
+import { inJsonStringArray } from '../../utils/inJsonStringArray';
 import { TopicModel } from '../topic';
 import type { UserMemoryHybridSearchAggregatedResult } from './query';
 import { UserMemoryQueryModel } from './query';
+import { buildUserMemoryWhere } from './where';
 
 const normalizeRelationshipValue = (input: unknown): RelationshipEnum | null => {
   if (input === null) return null;
@@ -315,6 +318,12 @@ export interface UpdateIdentityEntryParams {
   identity?: IdentityEntryPayload;
   identityId: string;
   mergeStrategy?: MergeStrategyEnum;
+  /**
+   * With `replace`, only overwrite the identity fields present in `identity` and keep the
+   * rest. Tool calls send just the fields they change; the extractor sends a full identity
+   * and relies on omitted fields being cleared, so it leaves this off.
+   */
+  preserveOmittedFields?: boolean;
 }
 
 export interface ContextEntryPayload {
@@ -427,6 +436,17 @@ export interface GetMemoryDetailParams {
   id: string;
   layer: LayersEnum;
 }
+
+const isPlainRecord = (value: unknown): value is Record<string, unknown> =>
+  !!value && typeof value === 'object' && !Array.isArray(value);
+
+/**
+ * Shallow-merge supplied metadata keys over the stored object inside the UPDATE itself, so
+ * concurrent partial updates of different keys cannot overwrite each other with a stale read.
+ * A stored value that is not a JSON object is treated as empty.
+ */
+const mergeMetadataKeysSql = (column: AnyColumn, supplied: Record<string, unknown>) =>
+  sql`(CASE WHEN jsonb_typeof(${column}) = 'object' THEN ${column} ELSE '{}'::jsonb END) || ${JSON.stringify(supplied)}::jsonb`;
 
 export class UserMemoryModel {
   static parseAssociatedObjects(value?: unknown): Record<string, unknown>[] {
@@ -547,15 +567,19 @@ export class UserMemoryModel {
   private topicModel: TopicModel;
   private queryModel: UserMemoryQueryModel;
 
-  constructor(db: LobeChatDatabase, userId: string) {
+  constructor(
+    db: LobeChatDatabase,
+    userId: string,
+    private readonly ftsSearchCandidateSource?: FtsSearchCandidateSource,
+  ) {
     this.userId = userId;
     this.db = db;
-    this.queryModel = new UserMemoryQueryModel(db, userId);
+    this.queryModel = new UserMemoryQueryModel(db, userId, ftsSearchCandidateSource);
     this.topicModel = new TopicModel(db, userId);
   }
 
-  private memoryWhere(table: { userId: any }) {
-    return eq(table.userId, this.userId);
+  private memoryWhere(table: Parameters<typeof buildUserMemoryWhere>[2]) {
+    return buildUserMemoryWhere(this.db, this.userId, table);
   }
 
   private extractSourceMetadata(metadata?: Record<string, unknown> | null): {
@@ -959,6 +983,81 @@ export class UserMemoryModel {
     const bm25MatchQuery = normalizedQuery
       ? normalizeBm25MatchQuery(normalizedQuery, SAFE_BM25_QUERY_OPTIONS)
       : '';
+    const candidateConfig = (() => {
+      switch (resolvedLayer) {
+        case LayersEnum.Activity: {
+          return {
+            entity: 'memoryActivities' as const,
+            fields: [
+              'parent_title',
+              'parent_summary',
+              'parent_details',
+              'narrative',
+              'notes',
+              'feedback',
+            ],
+          };
+        }
+        case LayersEnum.Context: {
+          return {
+            entity: 'memoryContexts' as const,
+            fields: ['parent_text', 'title', 'description', 'current_status'],
+          };
+        }
+        case LayersEnum.Experience: {
+          return {
+            entity: 'memoryExperiences' as const,
+            fields: [
+              'parent_title',
+              'parent_summary',
+              'parent_details',
+              'situation',
+              'key_learning',
+              'action',
+            ],
+          };
+        }
+        case LayersEnum.Identity: {
+          return {
+            entity: 'memoryIdentities' as const,
+            fields: ['parent_title', 'parent_summary', 'parent_details', 'description', 'role'],
+          };
+        }
+        case LayersEnum.Preference: {
+          return {
+            entity: 'memoryPreferences' as const,
+            fields: [
+              'parent_title',
+              'parent_summary',
+              'parent_details',
+              'conclusion_directives',
+              'suggestions',
+            ],
+          };
+        }
+        default: {
+          return undefined;
+        }
+      }
+    })();
+    const candidateResult =
+      normalizedQuery && candidateConfig && this.ftsSearchCandidateSource?.ftsSearchCandidateEnabled
+        ? await this.ftsSearchCandidateSource.ftsSearchCandidates({
+            entity: candidateConfig.entity,
+            filters: {
+              ...(categories?.length ? { memoryCategories: categories } : {}),
+              ...((resolvedLayer === LayersEnum.Activity || resolvedLayer === LayersEnum.Context) &&
+              status?.length
+                ? { memoryStatus: status }
+                : {}),
+              ...(tags?.length ? { memoryTagMatch: 'any' as const, memoryTags: tags } : {}),
+              ...(types?.length ? { memoryTypes: types } : {}),
+            },
+            pagination: {},
+            query: { fields: candidateConfig.fields, text: normalizedQuery },
+          })
+        : undefined;
+    const candidateIds = candidateResult?.candidates.map(({ id }) => id);
     // NOTICE:
     // Why this workaround is needed.
     // PGlite-based tests do not provide ParadeDB `pg_search`, so BM25 `@@@`
@@ -1043,27 +1142,36 @@ export class UserMemoryModel {
 
         const contextFilters: Array<SQL | undefined> = [
           whereClause,
-          buildTextSearchCondition({
-            bm25MatchQuery,
-            groups: [
-              {
-                fallbackColumns: [userMemories.title, userMemories.summary, userMemories.details],
-                fields: ['title', 'summary', 'details'],
-                keyColumn: userMemories.id,
-              },
-              {
-                fallbackColumns: [
-                  userMemoriesContexts.title,
-                  userMemoriesContexts.description,
-                  userMemoriesContexts.currentStatus,
+          candidateIds
+            ? inJsonStringArray(userMemoriesContexts.id, candidateIds)
+            : buildTextSearchCondition({
+                bm25MatchQuery,
+                groups: [
+                  {
+                    fallbackColumns: [
+                      userMemories.title,
+                      userMemories.summary,
+                      userMemories.details,
+                    ],
+                    fields: ['title', 'summary', 'details'],
+                    keyColumn: userMemories.id,
+                  },
+                  {
+                    fallbackColumns: [
+                      userMemoriesContexts.title,
+                      userMemoriesContexts.description,
+                      userMemoriesContexts.currentStatus,
+                    ],
+                    fields: ['title', 'description', 'current_status'],
+                    keyColumn: userMemoriesContexts.id,
+                  },
                 ],
-                fields: ['title', 'description', 'current_status'],
-                keyColumn: userMemoriesContexts.id,
-              },
-            ],
-            normalizedQuery,
-            supportsBm25,
-          }),
+                normalizedQuery,
+                supportsBm25,
+              }),
+          status && status.length > 0
+            ? inArray(userMemoriesContexts.currentStatus, status)
+            : undefined,
           types && types.length > 0 ? inArray(userMemoriesContexts.type, types) : undefined,
           tags && tags.length > 0
             ? or(
@@ -1150,27 +1258,33 @@ export class UserMemoryModel {
 
         const activityFilters: Array<SQL | undefined> = [
           whereClause,
-          buildTextSearchCondition({
-            bm25MatchQuery,
-            groups: [
-              {
-                fallbackColumns: [userMemories.title, userMemories.summary, userMemories.details],
-                fields: ['title', 'summary', 'details'],
-                keyColumn: userMemories.id,
-              },
-              {
-                fallbackColumns: [
-                  userMemoriesActivities.narrative,
-                  userMemoriesActivities.notes,
-                  userMemoriesActivities.feedback,
+          candidateIds
+            ? inJsonStringArray(userMemoriesActivities.id, candidateIds)
+            : buildTextSearchCondition({
+                bm25MatchQuery,
+                groups: [
+                  {
+                    fallbackColumns: [
+                      userMemories.title,
+                      userMemories.summary,
+                      userMemories.details,
+                    ],
+                    fields: ['title', 'summary', 'details'],
+                    keyColumn: userMemories.id,
+                  },
+                  {
+                    fallbackColumns: [
+                      userMemoriesActivities.narrative,
+                      userMemoriesActivities.notes,
+                      userMemoriesActivities.feedback,
+                    ],
+                    fields: ['narrative', 'notes', 'feedback'],
+                    keyColumn: userMemoriesActivities.id,
+                  },
                 ],
-                fields: ['narrative', 'notes', 'feedback'],
-                keyColumn: userMemoriesActivities.id,
-              },
-            ],
-            normalizedQuery,
-            supportsBm25,
-          }),
+                normalizedQuery,
+                supportsBm25,
+              }),
           types && types.length > 0 ? inArray(userMemoriesActivities.type, types) : undefined,
           status && status.length > 0 ? inArray(userMemoriesActivities.status, status) : undefined,
           tags && tags.length > 0
@@ -1265,27 +1379,33 @@ export class UserMemoryModel {
 
         const experienceFilters: Array<SQL | undefined> = [
           whereClause,
-          buildTextSearchCondition({
-            bm25MatchQuery,
-            groups: [
-              {
-                fallbackColumns: [userMemories.title, userMemories.summary, userMemories.details],
-                fields: ['title', 'summary', 'details'],
-                keyColumn: userMemories.id,
-              },
-              {
-                fallbackColumns: [
-                  userMemoriesExperiences.situation,
-                  userMemoriesExperiences.keyLearning,
-                  userMemoriesExperiences.action,
+          candidateIds
+            ? inJsonStringArray(userMemoriesExperiences.id, candidateIds)
+            : buildTextSearchCondition({
+                bm25MatchQuery,
+                groups: [
+                  {
+                    fallbackColumns: [
+                      userMemories.title,
+                      userMemories.summary,
+                      userMemories.details,
+                    ],
+                    fields: ['title', 'summary', 'details'],
+                    keyColumn: userMemories.id,
+                  },
+                  {
+                    fallbackColumns: [
+                      userMemoriesExperiences.situation,
+                      userMemoriesExperiences.keyLearning,
+                      userMemoriesExperiences.action,
+                    ],
+                    fields: ['situation', 'key_learning', 'action'],
+                    keyColumn: userMemoriesExperiences.id,
+                  },
                 ],
-                fields: ['situation', 'key_learning', 'action'],
-                keyColumn: userMemoriesExperiences.id,
-              },
-            ],
-            normalizedQuery,
-            supportsBm25,
-          }),
+                normalizedQuery,
+                supportsBm25,
+              }),
           types && types.length > 0 ? inArray(userMemoriesExperiences.type, types) : undefined,
           tags && tags.length > 0
             ? or(...tags.map((tag) => sql<boolean>`${tag} = ANY(${userMemoriesExperiences.tags})`))
@@ -1360,23 +1480,32 @@ export class UserMemoryModel {
 
         const identityFilters: Array<SQL | undefined> = [
           whereClause,
-          buildTextSearchCondition({
-            bm25MatchQuery,
-            groups: [
-              {
-                fallbackColumns: [userMemories.title, userMemories.summary, userMemories.details],
-                fields: ['title', 'summary', 'details'],
-                keyColumn: userMemories.id,
-              },
-              {
-                fallbackColumns: [userMemoriesIdentities.description, userMemoriesIdentities.role],
-                fields: ['description', 'role'],
-                keyColumn: userMemoriesIdentities.id,
-              },
-            ],
-            normalizedQuery,
-            supportsBm25,
-          }),
+          candidateIds
+            ? inJsonStringArray(userMemoriesIdentities.id, candidateIds)
+            : buildTextSearchCondition({
+                bm25MatchQuery,
+                groups: [
+                  {
+                    fallbackColumns: [
+                      userMemories.title,
+                      userMemories.summary,
+                      userMemories.details,
+                    ],
+                    fields: ['title', 'summary', 'details'],
+                    keyColumn: userMemories.id,
+                  },
+                  {
+                    fallbackColumns: [
+                      userMemoriesIdentities.description,
+                      userMemoriesIdentities.role,
+                    ],
+                    fields: ['description', 'role'],
+                    keyColumn: userMemoriesIdentities.id,
+                  },
+                ],
+                normalizedQuery,
+                supportsBm25,
+              }),
           types && types.length > 0 ? inArray(userMemoriesIdentities.type, types) : undefined,
           tags && tags.length > 0
             ? or(...tags.map((tag) => sql<boolean>`${tag} = ANY(${userMemoriesIdentities.tags})`))
@@ -1458,26 +1587,32 @@ export class UserMemoryModel {
 
         const preferenceFilters: Array<SQL | undefined> = [
           whereClause,
-          buildTextSearchCondition({
-            bm25MatchQuery,
-            groups: [
-              {
-                fallbackColumns: [userMemories.title, userMemories.summary, userMemories.details],
-                fields: ['title', 'summary', 'details'],
-                keyColumn: userMemories.id,
-              },
-              {
-                fallbackColumns: [
-                  userMemoriesPreferences.conclusionDirectives,
-                  userMemoriesPreferences.suggestions,
+          candidateIds
+            ? inJsonStringArray(userMemoriesPreferences.id, candidateIds)
+            : buildTextSearchCondition({
+                bm25MatchQuery,
+                groups: [
+                  {
+                    fallbackColumns: [
+                      userMemories.title,
+                      userMemories.summary,
+                      userMemories.details,
+                    ],
+                    fields: ['title', 'summary', 'details'],
+                    keyColumn: userMemories.id,
+                  },
+                  {
+                    fallbackColumns: [
+                      userMemoriesPreferences.conclusionDirectives,
+                      userMemoriesPreferences.suggestions,
+                    ],
+                    fields: ['conclusion_directives', 'suggestions'],
+                    keyColumn: userMemoriesPreferences.id,
+                  },
                 ],
-                fields: ['conclusion_directives', 'suggestions'],
-                keyColumn: userMemoriesPreferences.id,
-              },
-            ],
-            normalizedQuery,
-            supportsBm25,
-          }),
+                normalizedQuery,
+                supportsBm25,
+              }),
           types && types.length > 0 ? inArray(userMemoriesPreferences.type, types) : undefined,
           tags && tags.length > 0
             ? or(...tags.map((tag) => sql<boolean>`${tag} = ANY(${userMemoriesPreferences.tags})`))
@@ -2268,7 +2403,14 @@ export class UserMemoryModel {
           baseUpdate.updatedAt = new Date();
           await tx
             .update(userMemories)
-            .set(baseUpdate)
+            .set(
+              params.preserveOmittedFields && isPlainRecord(baseUpdate.metadata)
+                ? {
+                    ...baseUpdate,
+                    metadata: mergeMetadataKeysSql(userMemories.metadata, baseUpdate.metadata),
+                  }
+                : baseUpdate,
+            )
             .where(and(eq(userMemories.id, identity.userMemoryId), this.memoryWhere(userMemories)));
         }
       }
@@ -2299,6 +2441,14 @@ export class UserMemoryModel {
                   ? null
                   : (normalizeIdentityTypeValue(identity.type) ?? null),
           };
+
+          if (params.preserveOmittedFields) {
+            for (const key of Object.keys(identityUpdate) as (keyof typeof identityUpdate)[]) {
+              if (identity[key as keyof IdentityEntryPayload] === undefined) {
+                delete identityUpdate[key];
+              }
+            }
+          }
         } else {
           identityUpdate = merge(identityUpdate, params.identity);
 
@@ -2329,7 +2479,19 @@ export class UserMemoryModel {
           identityUpdate.updatedAt = new Date();
           await tx
             .update(userMemoriesIdentities)
-            .set(identityUpdate)
+            .set(
+              // A partial tool update names only the metadata keys it changes (e.g.
+              // scoreConfidence); keep the other stored keys such as sourceEvidence.
+              params.preserveOmittedFields && isPlainRecord(identityUpdate.metadata)
+                ? {
+                    ...identityUpdate,
+                    metadata: mergeMetadataKeysSql(
+                      userMemoriesIdentities.metadata,
+                      identityUpdate.metadata,
+                    ),
+                  }
+                : identityUpdate,
+            )
             .where(
               and(
                 eq(userMemoriesIdentities.id, params.identityId),
@@ -2378,16 +2540,17 @@ export class UserMemoryModel {
       const memoryIds = Array.isArray(context.userMemoryIds)
         ? (context.userMemoryIds as string[])
         : [];
+
+      // Delete the authorized child while its live-parent guard still matches.
+      await tx
+        .delete(userMemoriesContexts)
+        .where(and(eq(userMemoriesContexts.id, contextId), this.memoryWhere(userMemoriesContexts)));
+
       if (memoryIds.length > 0) {
         await tx
           .delete(userMemories)
           .where(and(inArray(userMemories.id, memoryIds), this.memoryWhere(userMemories)));
       }
-
-      // Delete the context entry
-      await tx
-        .delete(userMemoriesContexts)
-        .where(and(eq(userMemoriesContexts.id, contextId), this.memoryWhere(userMemoriesContexts)));
 
       return true;
     });

@@ -186,10 +186,6 @@ export const UserLabSchema = z.object({
    */
   enableImessage: z.boolean().optional(),
   /**
-   * show the in-app Browser tab in the conversation WorkingSidebar (desktop only)
-   */
-  enableInAppBrowser: z.boolean().optional(),
-  /**
    * enable markdown rendering in chat input editor
    */
   enableInputMarkdown: z.boolean().optional(),
@@ -197,6 +193,11 @@ export const UserLabSchema = z.object({
    * enable selecting message text and adding it to the next conversation context
    */
   enableMessageTextSelectionActions: z.boolean().optional(),
+  /**
+   * show the Integrations settings page (GitHub App and the coming-soon
+   * directory); hidden until the closed loop leaves alpha
+   */
+  enableIntegrations: z.boolean().optional(),
   /**
    * show OAuth app management in personal and workspace settings
    */
@@ -206,17 +207,71 @@ export const UserLabSchema = z.object({
    */
   enableProjects: z.boolean().optional(),
   /**
+   * self-evolving: inject what was learned (the user's rules and each agent's own lessons) into
+   * runs, and show it under memory and on each agent's self-learning page. The former separate
+   * "my rules" switch (`enableMemoryRules`) is folded into this one.
+   */
+  enableSelfLearning: z.boolean().optional(),
+  /**
    * enable the task delivery-acceptance (verify) config UI on the task detail
    */
   enableTaskVerify: z.boolean().optional(),
+  /** Capture a conversation turn as an eval test case (developer-facing). */
+  enableEvalCapture: z.boolean().optional(),
   /**
-   * enable the per-topic acceptance tray above the composer (author a topic's
-   * delivery checklist inline)
+   * enable Goals: hand the agent a goal it plans into tasks, tracks and delivers
+   */
+  enableGoals: z.boolean().optional(),
+  /**
+   * @deprecated Renamed to `enableGoals`. Written alongside it, and read first,
+   * while older clients that only know this key are still around: their writes
+   * touch only this key, so it carries the latest choice.
    */
   enableTopicAcceptance: z.boolean().optional(),
+  /**
+   * expose a port on the working device through a tunnel link, so a dev server
+   * running there can be opened from this UI
+   */
+  enableDeviceTunnel: z.boolean().optional(),
+  /**
+   * opt this user's cloud-sandbox runs into a persistent workspace: the working
+   * directory survives session recycling and is shared across their topics,
+   * instead of being thrown away with the sandbox
+   */
+  enablePersistentSandbox: z.boolean().optional(),
 });
 
 export type UserLab = z.infer<typeof UserLabSchema>;
+
+/** Automation switches for the GitHub integration. Every switch defaults to on. */
+export interface GithubIntegrationPreference {
+  /** Merging a linked pull request accepts its acceptance. */
+  acceptOnMerge?: boolean;
+  /** Post a LobeHub comment (acceptance + conversation links) on pull requests in private repositories. Default on. */
+  commentOnPrivateRepositories?: boolean;
+  /** Same for public repositories. Default off: a public thread is not the place for internal links. */
+  commentOnPublicRepositories?: boolean;
+  /** A failing check wakes the agent that opened the pull request. */
+  wakeOnCiFailure?: boolean;
+  /** Review feedback (changes requested, comments) wakes the agent. */
+  wakeOnReview?: boolean;
+}
+
+export interface UserIntegrationPreference {
+  github?: GithubIntegrationPreference;
+}
+
+export const GithubIntegrationPreferenceSchema = z.object({
+  acceptOnMerge: z.boolean().optional(),
+  commentOnPrivateRepositories: z.boolean().optional(),
+  commentOnPublicRepositories: z.boolean().optional(),
+  wakeOnCiFailure: z.boolean().optional(),
+  wakeOnReview: z.boolean().optional(),
+});
+
+export const UserIntegrationPreferenceSchema = z.object({
+  github: GithubIntegrationPreferenceSchema.optional(),
+});
 
 export interface UserPreference {
   /** Last-used app for "Open working directory in…" split button. Empty/unknown values fall back to platform default. */
@@ -226,11 +281,22 @@ export interface UserPreference {
    * @deprecated Use lab.enableInputMarkdown instead
    */
   disableInputMarkdownRender?: boolean;
+  /**
+   * CSS font-family value used as the global default UI font.
+   * Empty or whitespace-only values fall back to the application font stack.
+   */
+  fontFamily?: string;
   guide?: UserGuide;
   hideSyncAlert?: boolean;
   /**
    * lab experimental features
    */
+  /**
+   * Per-integration automation switches, edited on Settings → Integrations.
+   * Absent keys mean "on": the closed loop is the default, the switch is the
+   * opt-out.
+   */
+  integration?: UserIntegrationPreference;
   lab?: UserLab;
   /**
    * Last active workspace id. Used on cloud to land the user back in the
@@ -319,8 +385,10 @@ export interface SSOProvider {
 export const UserPreferenceSchema = z
   .object({
     defaultOpenInApp: z.string().optional(),
+    fontFamily: z.string().optional(),
     guide: UserGuideSchema.optional(),
     hideSyncAlert: z.boolean().optional(),
+    integration: UserIntegrationPreferenceSchema.optional(),
     lab: UserLabSchema.optional(),
     lastWorkspaceId: z.string().nullish(),
     sidebarHiddenAgentIds: z.array(z.string()).optional(),

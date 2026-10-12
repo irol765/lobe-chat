@@ -8,19 +8,24 @@ import type {
   HeterogeneousAgentModelCatalogErrorCode,
   ListHeterogeneousAgentModelsParams,
 } from '@lobechat/types';
+import { isRecord } from '@lobechat/utils/object';
 
 import { getHeterogeneousTypeLabel } from '../labels';
 import { resolveCliSpawnPlan } from '../spawn/cliSpawn';
+import { listDroidAcpModels } from '../spawn/droidAcpSession';
 import { resolveHeteroSpawnCommand } from '../spawn/resolveCliCommand';
 import { listTraeAcpModels } from '../spawn/traeAcpSession';
+import { listCodexModels } from './codex';
 
 const execFilePromise = promisify(execFile);
-const MODEL_CATALOG_MAX_BUFFER = 256 * 1024;
+// Large catalogs (including Devin's model variants and metadata) exceed 256 KiB.
+const MODEL_CATALOG_MAX_BUFFER = 4 * 1024 * 1024;
 const MODEL_CATALOG_TIMEOUT_MS = 15_000;
 const CODEBUDDY_MODEL_OPTION = '--model <model>';
 const CODEBUDDY_SUPPORTED_MODELS_LABEL = 'Currently supported:';
 const CURSOR_MODEL_ANNOTATIONS = [' (current)', ' (default)'] as const;
 const CURSOR_MODEL_ID_PATTERN = /^[A-Z0-9][\w./:@+-]*$/i;
+const GROK_MODEL_ID_PATTERN = /^[A-Z0-9][\w./:@+-]*$/i;
 const OPENCODE_MODEL_ID_PATTERN = /^[A-Z0-9][\w.-]*\/[A-Z0-9@][\w./:@+-]*$/i;
 const PI_MODEL_ROW_PATTERN = /^(\S+)\s{2,}(\S+)\s{2,}\S+\s{2,}\S+\s{2,}(?:yes|no)\s{2,}(?:yes|no)$/;
 const QODER_CUSTOM_MODEL_ROW_PATTERN = /^(.+?) \(([^()\s]+)\)$/;
@@ -80,6 +85,71 @@ export const parseCursorModelCatalog = (stdout: string): HeterogeneousAgentModel
   return models;
 };
 
+export const parseDevinModelCatalog = (stdout: string): HeterogeneousAgentModel[] => {
+  let result: unknown;
+  try {
+    result = JSON.parse(stdout);
+  } catch {
+    return [];
+  }
+  if (!isRecord(result) || !Array.isArray(result.families)) return [];
+
+  const seen = new Set<string>();
+  const models: HeterogeneousAgentModel[] = [];
+  for (const family of result.families) {
+    if (!isRecord(family) || !Array.isArray(family.variants)) continue;
+    for (const variant of family.variants) {
+      if (!isRecord(variant) || typeof variant.model_uid !== 'string' || !variant.model_uid)
+        continue;
+      if (seen.has(variant.model_uid)) continue;
+
+      seen.add(variant.model_uid);
+      models.push({
+        id: variant.model_uid,
+        ...(typeof variant.label === 'string' && variant.label
+          ? { label: variant.label }
+          : undefined),
+        modelId: variant.model_uid,
+        providerId: 'devin',
+      });
+    }
+  }
+
+  return models;
+};
+
+/** Parse the model rows emitted by `grok models`. */
+export const parseGrokBuildModelCatalog = (stdout: string): HeterogeneousAgentModel[] => {
+  const seen = new Set<string>();
+  const models: HeterogeneousAgentModel[] = [];
+
+  for (const rawLine of stdout.split(/\r?\n/)) {
+    const line = rawLine
+      .trim()
+      .replace(/^[*>•✓-]\s*/, '')
+      .replace(/ \((?:current|default)\)$/, '');
+    const separatorIndex = line.search(/\s{2}/);
+    const id = (separatorIndex < 0 ? line : line.slice(0, separatorIndex)).trim();
+    if (!GROK_MODEL_ID_PATTERN.test(id)) continue;
+
+    if (id.toLowerCase() === 'model' || id.toLowerCase() === 'models' || seen.has(id)) continue;
+
+    const label = (separatorIndex < 0 ? '' : line.slice(separatorIndex).trim())
+      .replaceAll(' (current)', '')
+      .replaceAll(' (default)', '')
+      .trim();
+    seen.add(id);
+    models.push({
+      id,
+      ...(label ? { label } : {}),
+      modelId: id,
+      providerId: 'grok-build',
+    });
+  }
+
+  return models;
+};
+
 export const parseOpenCodeModelCatalog = (stdout: string): HeterogeneousAgentModel[] => {
   const seen = new Set<string>();
   const models: HeterogeneousAgentModel[] = [];
@@ -115,6 +185,37 @@ export const parsePiModelCatalog = (stdout: string): HeterogeneousAgentModel[] =
 
     seen.add(id);
     models.push({ id, modelId, providerId });
+  }
+
+  return models;
+};
+
+/**
+ * Parse the JSON emitted by `kimi provider list --json`. The `-m` flag accepts
+ * the model alias (the `models` table key), so the alias is the catalog id.
+ */
+export const parseKimiCodeModelCatalog = (stdout: string): HeterogeneousAgentModel[] => {
+  let result: unknown;
+  try {
+    result = JSON.parse(stdout);
+  } catch {
+    return [];
+  }
+  if (!isRecord(result) || !isRecord(result.models)) return [];
+
+  const models: HeterogeneousAgentModel[] = [];
+  for (const [alias, entry] of Object.entries(result.models)) {
+    if (!alias || !isRecord(entry) || typeof entry.model !== 'string' || !entry.model) continue;
+
+    const separatorIndex = alias.indexOf('/');
+    models.push({
+      id: alias,
+      ...(typeof entry.displayName === 'string' && entry.displayName
+        ? { label: entry.displayName }
+        : undefined),
+      modelId: entry.model,
+      providerId: separatorIndex > 0 ? alias.slice(0, separatorIndex) : alias,
+    });
   }
 
   return models;
@@ -161,8 +262,12 @@ const getErrorRecord = (error: unknown) =>
   };
 
 const classifyCatalogError = (error: unknown): HeterogeneousAgentModelCatalogErrorCode => {
+  // The app-server client wraps spawn errors with their original cause.
+  if (error instanceof Error && error.cause) return classifyCatalogError(error.cause);
   const { code, killed, signal } = getErrorRecord(error);
   if (code === 'ENOENT') return 'cli_not_found';
+  if (code === 'unsupported_client') return 'unsupported_client';
+  if (code === 'unsupported_configuration') return 'unsupported_configuration';
   if (code === 'ETIMEDOUT' || killed || signal === 'SIGTERM') return 'timeout';
   return 'command_failed';
 };
@@ -205,6 +310,28 @@ export const listHeterogeneousAgentModels = async (
   };
 
   try {
+    if (params.type === 'codex') {
+      const models = await listCodexModels({
+        args: params.args,
+        commandPath: resolved.command,
+        cwd: params.cwd ?? process.cwd(),
+        env: env as NodeJS.ProcessEnv,
+        timeoutMs: MODEL_CATALOG_TIMEOUT_MS,
+      });
+      return { models, status: 'success', updatedAt };
+    }
+
+    if (params.type === 'droid') {
+      const models = await listDroidAcpModels({
+        args: params.args,
+        commandPath: resolved.command,
+        cwd: params.cwd ?? process.cwd(),
+        env: env as NodeJS.ProcessEnv,
+        timeoutMs: MODEL_CATALOG_TIMEOUT_MS,
+      });
+      return { models, status: 'success', updatedAt };
+    }
+
     if (params.type === 'trae') {
       const models = await listTraeAcpModels({
         args: params.args,
@@ -219,9 +346,13 @@ export const listHeterogeneousAgentModels = async (
     const args =
       params.type === 'codebuddy'
         ? ['--help']
-        : params.type === 'opencode'
-          ? ['models']
-          : ['--list-models'];
+        : params.type === 'devin'
+          ? ['models', 'list', '--format', 'json']
+          : params.type === 'grok-build' || params.type === 'opencode'
+            ? ['models']
+            : params.type === 'kimi-code'
+              ? ['provider', 'list', '--json']
+              : ['--list-models'];
     const spawnPlan = await resolveCliSpawnPlan(resolved.command, args);
     const { stderr, stdout } = await execFilePromise(spawnPlan.command, spawnPlan.args, {
       cwd: params.cwd,
@@ -254,11 +385,17 @@ export const listHeterogeneousAgentModels = async (
       models:
         params.type === 'cursor'
           ? parseCursorModelCatalog(String(stdout))
-          : params.type === 'pi'
-            ? parsePiModelCatalog(String(stdout))
-            : params.type === 'qoder'
-              ? parseQoderModelCatalog(String(stdout))
-              : parseOpenCodeModelCatalog(String(stdout)),
+          : params.type === 'devin'
+            ? parseDevinModelCatalog(String(stdout))
+            : params.type === 'grok-build'
+              ? parseGrokBuildModelCatalog(String(stdout))
+              : params.type === 'kimi-code'
+                ? parseKimiCodeModelCatalog(String(stdout))
+                : params.type === 'pi'
+                  ? parsePiModelCatalog(String(stdout))
+                  : params.type === 'qoder'
+                    ? parseQoderModelCatalog(String(stdout))
+                    : parseOpenCodeModelCatalog(String(stdout)),
       status: 'success',
       updatedAt,
     };

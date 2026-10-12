@@ -1,24 +1,14 @@
 'use client';
 
-import { useAnalytics } from '@lobehub/analytics/react';
-import { ActionIcon, Flexbox, Tooltip } from '@lobehub/ui';
-import { Button } from '@lobehub/ui/base-ui';
-import { Carousel as AntCarousel } from 'antd';
+import { Flexbox, Tooltip } from '@lobehub/ui';
+import { ActionIcon, Button, Carousel } from '@lobehub/ui/base-ui';
 import { createStaticStyles, cssVar } from 'antd-style';
 import { X } from 'lucide-react';
-import { motion } from 'motion/react';
-import {
-  type ComponentRef,
-  memo,
-  useCallback,
-  useEffect,
-  useLayoutEffect,
-  useMemo,
-  useRef,
-  useState,
-} from 'react';
+import * as m from 'motion/react-m';
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
+import { useAnalytics } from '@/libs/analytics/client';
 import type { GlobalBillboard, GlobalBillboardItem } from '@/types/serverConfig';
 
 import { resolveBillboardAction, runBillboardAction } from './actions';
@@ -68,8 +58,7 @@ const styles = createStaticStyles(({ css }) => ({
     inset-inline-end: 8px;
 
     /* Sits over the cover image (140px band) — give it its own opaque surface so
-       the icon reads on any image, and lift z-index above the carousel dots /
-       slick internals. */
+       the icon reads on any image, and lift z-index above the carousel slides. */
     color: #fff;
 
     background: rgb(0 0 0 / 45%);
@@ -134,115 +123,117 @@ const styles = createStaticStyles(({ css }) => ({
   `,
 }));
 
-const ItemContent = memo<{ billboardSlug: string; item: BillboardItem; position: number }>(
-  ({ item, billboardSlug, position }) => {
-    const { t, i18n } = useTranslation('notification');
-    const { analytics } = useAnalytics();
-    const resolved = useMemo(
-      () => resolveBillboardItem(item, i18n.language),
-      [item, i18n.language],
-    );
+const ItemContent = memo<{
+  billboardSlug: string;
+  item: BillboardItem;
+  onClose: () => void;
+  position: number;
+}>(({ item, billboardSlug, position, onClose }) => {
+  const { t, i18n } = useTranslation('notification');
+  const { analytics } = useAnalytics();
+  const resolved = useMemo(() => resolveBillboardItem(item, i18n.language), [item, i18n.language]);
 
-    const action = resolveBillboardAction(item.action);
+  const action = resolveBillboardAction(item.action);
 
-    const trackCtaClick = useCallback(
-      (extra: Record<string, unknown>) => {
-        analytics?.track({
-          name: 'billboard_cta_clicked',
-          properties: {
-            billboard_slug: billboardSlug,
-            item_id: item.id,
-            position,
-            spm: 'billboard.cta.clicked',
-            ...extra,
-          },
-        });
-      },
-      [analytics, billboardSlug, item.id, position],
-    );
+  const trackCtaClick = useCallback(
+    (extra: Record<string, unknown>) => {
+      analytics?.track({
+        name: 'billboard_cta_clicked',
+        properties: {
+          billboard_slug: billboardSlug,
+          item_id: item.id,
+          position,
+          spm: 'billboard.cta.clicked',
+          ...extra,
+        },
+      });
+    },
+    [analytics, billboardSlug, item.id, position],
+  );
 
-    const handleActionClick = useCallback(async () => {
-      if (!action) return;
-      trackCtaClick({ action });
-      await Promise.resolve(runBillboardAction(action)).catch(() => {});
-    }, [action, trackCtaClick]);
+  const handleActionClick = useCallback(async () => {
+    if (!action) return;
+    trackCtaClick({ action });
+    onClose();
+    await Promise.resolve(runBillboardAction(action)).catch(() => {});
+  }, [action, trackCtaClick, onClose]);
 
-    const handleLinkClick = useCallback(() => {
-      trackCtaClick({ link_url: item.linkUrl });
-    }, [trackCtaClick, item.linkUrl]);
+  const handleLinkClick = useCallback(() => {
+    trackCtaClick({ link_url: item.linkUrl });
+    onClose();
+  }, [trackCtaClick, item.linkUrl, onClose]);
 
-    const titleRef = useRef<HTMLDivElement>(null);
-    const descRef = useRef<HTMLDivElement>(null);
-    const [titleOverflow, setTitleOverflow] = useState(false);
-    const [descOverflow, setDescOverflow] = useState(false);
+  const titleRef = useRef<HTMLDivElement>(null);
+  const descRef = useRef<HTMLDivElement>(null);
+  const [titleOverflow, setTitleOverflow] = useState(false);
+  const [descOverflow, setDescOverflow] = useState(false);
 
-    useLayoutEffect(() => {
-      const el = titleRef.current;
-      if (!el) return;
-      setTitleOverflow(el.scrollHeight > el.clientHeight + 1);
-    }, [resolved.title]);
+  useLayoutEffect(() => {
+    const el = titleRef.current;
+    if (!el) return;
+    setTitleOverflow(el.scrollHeight > el.clientHeight + 1);
+  }, [resolved.title]);
 
-    useLayoutEffect(() => {
-      const el = descRef.current;
-      if (!el) return;
-      setDescOverflow(el.scrollHeight > el.clientHeight + 1);
-    }, [resolved.description]);
+  useLayoutEffect(() => {
+    const el = descRef.current;
+    if (!el) return;
+    setDescOverflow(el.scrollHeight > el.clientHeight + 1);
+  }, [resolved.description]);
 
-    const titleNode = (
-      <div className={styles.title} ref={titleRef}>
-        {resolved.title}
-      </div>
-    );
+  const titleNode = (
+    <div className={styles.title} ref={titleRef}>
+      {resolved.title}
+    </div>
+  );
 
-    const descNode = resolved.description && (
-      <div className={styles.description} ref={descRef}>
-        {resolved.description}
-      </div>
-    );
+  const descNode = resolved.description && (
+    <div className={styles.description} ref={descRef}>
+      {resolved.description}
+    </div>
+  );
 
-    return (
-      <Flexbox gap={0}>
-        {item.cover && <img alt="" className={styles.image} src={item.cover} />}
-        <Flexbox className={styles.itemBody} gap={4}>
-          {titleOverflow ? (
-            <Tooltip placement="top" title={resolved.title}>
-              {titleNode}
+  return (
+    <Flexbox gap={0}>
+      {item.cover && <img alt="" className={styles.image} src={item.cover} />}
+      <Flexbox className={styles.itemBody} gap={4}>
+        {titleOverflow ? (
+          <Tooltip placement="top" title={resolved.title}>
+            {titleNode}
+          </Tooltip>
+        ) : (
+          titleNode
+        )}
+        {descNode &&
+          (descOverflow ? (
+            <Tooltip placement="top" title={resolved.description}>
+              {descNode}
             </Tooltip>
           ) : (
-            titleNode
-          )}
-          {descNode &&
-            (descOverflow ? (
-              <Tooltip placement="top" title={resolved.description}>
-                {descNode}
-              </Tooltip>
-            ) : (
-              descNode
-            ))}
-          {action ? (
-            <Button block className={styles.action} type="primary" onClick={handleActionClick}>
-              {resolved.linkLabel ?? t('billboard.learnMore')}
-            </Button>
-          ) : (
-            item.linkUrl && (
-              <a
-                className={styles.action}
-                href={item.linkUrl}
-                rel="noopener noreferrer"
-                target="_blank"
-                onClick={handleLinkClick}
-              >
-                <Button block type="primary">
-                  {resolved.linkLabel ?? t('billboard.learnMore')}
-                </Button>
-              </a>
-            )
-          )}
-        </Flexbox>
+            descNode
+          ))}
+        {action ? (
+          <Button block className={styles.action} type="primary" onClick={handleActionClick}>
+            {resolved.linkLabel ?? t('billboard.learnMore')}
+          </Button>
+        ) : (
+          item.linkUrl && (
+            <a
+              className={styles.action}
+              href={item.linkUrl}
+              rel="noopener noreferrer"
+              target="_blank"
+              onClick={handleLinkClick}
+            >
+              <Button block type="primary">
+                {resolved.linkLabel ?? t('billboard.learnMore')}
+              </Button>
+            </a>
+          )
+        )}
       </Flexbox>
-    );
-  },
-);
+    </Flexbox>
+  );
+});
 
 ItemContent.displayName = 'BillboardItemContent';
 
@@ -252,7 +243,6 @@ const BillboardCarousel = memo<BillboardCarouselProps>(
   ({ set, onClose, closing, exitTarget, onAnimationFinish, cardAttr }) => {
     const [paused, setPaused] = useState(false);
     const [current, setCurrent] = useState(0);
-    const carouselRef = useRef<ComponentRef<typeof AntCarousel>>(null);
     const { analytics } = useAnalytics();
 
     useEffect(() => {
@@ -281,7 +271,7 @@ const BillboardCarousel = memo<BillboardCarouselProps>(
     const cardDataProps = cardAttr ? { [cardAttr]: '' } : {};
 
     return (
-      <motion.div
+      <m.div
         {...cardDataProps}
         className={styles.card}
         initial={{ opacity: 0, scale: 0.92, y: 16 }}
@@ -299,35 +289,44 @@ const BillboardCarousel = memo<BillboardCarouselProps>(
       >
         <ActionIcon className={styles.closeButton} icon={X} size={14} onClick={onClose} />
         {single ? (
-          <ItemContent billboardSlug={set.slug} item={set.items[0]} position={0} />
+          <ItemContent
+            billboardSlug={set.slug}
+            item={set.items[0]}
+            position={0}
+            onClose={onClose}
+          />
         ) : (
           <>
-            <AntCarousel
+            <Carousel
               adaptiveHeight
-              autoplay={!paused}
-              autoplaySpeed={6000}
-              beforeChange={(_: number, next: number) => setCurrent(next)}
+              autoplay={paused ? false : 6000}
               dots={false}
-              ref={carouselRef}
+              index={current}
+              onIndexChange={setCurrent}
             >
               {set.items.map((item, idx) => (
                 <div key={item.id}>
-                  <ItemContent billboardSlug={set.slug} item={item} position={idx} />
+                  <ItemContent
+                    billboardSlug={set.slug}
+                    item={item}
+                    position={idx}
+                    onClose={onClose}
+                  />
                 </div>
               ))}
-            </AntCarousel>
+            </Carousel>
             <Flexbox horizontal className={styles.dots} gap={6} justify="center">
               {set.items.map((item, idx) => (
                 <div
                   className={`${styles.dot} ${current === idx ? styles.dotActive : ''}`}
                   key={item.id}
-                  onClick={() => carouselRef.current?.goTo(idx)}
+                  onClick={() => setCurrent(idx)}
                 />
               ))}
             </Flexbox>
           </>
         )}
-      </motion.div>
+      </m.div>
     );
   },
 );

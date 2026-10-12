@@ -4,6 +4,11 @@
  */
 export interface AskUserQuestionOption {
   description?: string;
+  /**
+   * Stable provider-owned value. When present the UI displays `label` but
+   * submits this exact id, avoiding ambiguous or localized-label mapping.
+   */
+  id?: string;
   label: string;
   /**
    * The tool schema has no recommendation field, so models mark their pick by
@@ -19,6 +24,11 @@ export interface AskUserQuestionOption {
  * is 2-4 entries, `multiSelect` is opt-in.
  */
 export interface AskUserQuestionItem {
+  /**
+   * Why the question matters — shown under it. Tool calls do not send one;
+   * hosts that ask their own questions (goal / task clarification) do.
+   */
+  description?: string;
   header: string;
   multiSelect?: boolean;
   options: AskUserQuestionOption[];
@@ -39,11 +49,12 @@ export interface AskUserQuestionArgs {
  * `pluginState.askUserDraft` so HMR reloads, store re-mounts, and tab switches
  * all keep partial answers around — only a fresh `tool_use` starts blank.
  *
- * Three independent answer slices, kept apart so picks and custom text can
+ * Four independent answer slices, kept apart so picks and custom text can
  * coexist on one question (multi-select) and a half-typed escape reply never
  * bleeds into the form payload:
  *   - `picks`   → multi-choice selections, keyed by question text
  *   - `custom`  → per-question "write your own" text, keyed by question text
+ *   - `supplement*` → optional notes appended to the structured answers
  *   - `escape*` → the global "Or type directly" box (whole-form bypass)
  *
  * Declared as a `type` (not `interface`) so it satisfies the
@@ -55,4 +66,6 @@ export type AskUserDraft = {
   escapeActive: boolean;
   escapeText: string;
   picks: Record<string, string | string[]>;
+  supplementActive: boolean;
+  supplementText: string;
 };

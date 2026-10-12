@@ -1,7 +1,7 @@
 'use client';
 
-import { Center, Flexbox, Tag, Text, TextArea } from '@lobehub/ui';
-import { Button } from '@lobehub/ui/base-ui';
+import { Center, Flexbox } from '@lobehub/ui';
+import { Button, Spin, Tag, Text, TextArea } from '@lobehub/ui/base-ui';
 import { createStaticStyles, cssVar } from 'antd-style';
 import { SendHorizontalIcon, SparklesIcon } from 'lucide-react';
 import { memo, useState } from 'react';
@@ -9,7 +9,6 @@ import { useTranslation } from 'react-i18next';
 import { useParams } from 'react-router';
 
 import AsyncError from '@/components/AsyncError';
-import NeuralNetworkLoading from '@/components/NeuralNetworkLoading';
 import { getProjectConversationStartPath } from '@/features/Projects/Layout/navigation';
 import ProjectDisabled from '@/features/Projects/ProjectDisabled';
 import { useWorkspaceAwareNavigate } from '@/features/Workspace/useWorkspaceAwareNavigate';
@@ -93,21 +92,22 @@ const ProjectWorkspace = memo(() => {
   const enabled = useUserStore(labPreferSelectors.enableProjects);
   const detail = useCurrentProjectDetail(projectId);
   const [message, setMessage] = useState('');
-  const { error, isLoading, mutate } = useProjectStore((s) => s.useFetchProjectDetail)(projectId);
+  const { error, revalidate } = useProjectStore((s) => s.useFetchProjectDetail)(projectId);
 
   if (!enabled) return <ProjectDisabled />;
-  if (error) return <AsyncError error={error} variant={'page'} onRetry={() => mutate()} />;
-  if (isLoading || !detail)
+  if (error && !detail)
+    return <AsyncError error={error} variant={'page'} onRetry={() => revalidate()} />;
+  if (!detail)
     return (
       <Center height={'100%'}>
-        <NeuralNetworkLoading />
+        <Spin size="small" />
       </Center>
     );
 
   const startConversation = () => {
     const content = message.trim();
     if (!content || !projectId) return;
-    navigate(getProjectConversationStartPath(projectId, content));
+    navigate(getProjectConversationStartPath(detail.project.slug ?? projectId, content));
   };
   const prompts = [
     t('overview.prompts.summarizeProgress'),
@@ -174,7 +174,7 @@ const ProjectWorkspace = memo(() => {
               </Flexbox>
             </Flexbox>
           </Flexbox>
-          <ProjectDashboard detail={detail} projectId={projectId!} />
+          <ProjectDashboard detail={detail} projectId={detail.project.id} />
         </Flexbox>
       </div>
     </Flexbox>

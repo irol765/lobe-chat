@@ -6,6 +6,7 @@ import { VerifyExecutorService } from '../executor';
 const mocks = vi.hoisted(() => ({
   aiGenerateObject: vi.fn(),
   aiModelFind: vi.fn(),
+  documentFindByIds: vi.fn(),
   evidenceListByRun: vi.fn(),
   fileAccessUrl: vi.fn(),
   fileFindById: vi.fn(),
@@ -21,44 +22,63 @@ vi.mock('@lobechat/model-runtime', () => ({
   getModelPropertyWithFallback: vi.fn(async () => ({ vision: false })),
 }));
 vi.mock('@/database/models/aiModel', () => ({
-  AiModelModel: vi.fn(() => ({ findByIdAndProvider: mocks.aiModelFind })),
+  AiModelModel: vi.fn(function () {
+    return { findByIdAndProvider: mocks.aiModelFind };
+  }),
 }));
 vi.mock('@/database/models/document', () => ({
-  DocumentModel: vi.fn(() => ({ findById: vi.fn() })),
+  DocumentModel: vi.fn(function () {
+    return { findById: vi.fn(), findByIds: mocks.documentFindByIds };
+  }),
 }));
 vi.mock('@/database/models/file', () => ({
-  FileModel: vi.fn(() => ({ findById: mocks.fileFindById })),
+  FileModel: vi.fn(function () {
+    return { findById: mocks.fileFindById };
+  }),
 }));
 vi.mock('@/database/models/verifyEvidence', () => ({
-  VerifyEvidenceModel: vi.fn(() => ({ listByRun: mocks.evidenceListByRun })),
+  VerifyEvidenceModel: vi.fn(function () {
+    return { listByRun: mocks.evidenceListByRun };
+  }),
 }));
 vi.mock('@/database/models/verifyCheckResult', () => ({
-  VerifyCheckResultModel: vi.fn(() => ({
-    createMany: mocks.resultCreateMany,
-    listByRun: mocks.resultListByRun,
-    updateByCheckItem: mocks.resultUpdateByCheckItem,
-  })),
+  VerifyCheckResultModel: vi.fn(function () {
+    return {
+      createMany: mocks.resultCreateMany,
+      listByRun: mocks.resultListByRun,
+      updateByCheckItem: mocks.resultUpdateByCheckItem,
+    };
+  }),
 }));
 vi.mock('@/database/models/verifyRun', () => ({
-  VerifyRunModel: vi.fn(() => ({ ensureForOperation: mocks.runEnsureForOperation })),
+  VerifyRunModel: vi.fn(function () {
+    return { ensureForOperation: mocks.runEnsureForOperation };
+  }),
 }));
 vi.mock('@/server/services/aiGeneration', () => ({
-  AiGenerationService: vi.fn(() => ({ generateObject: mocks.aiGenerateObject })),
+  AiGenerationService: vi.fn(function () {
+    return { generateObject: mocks.aiGenerateObject };
+  }),
 }));
 vi.mock('@/server/services/file', () => ({
-  FileService: vi.fn(() => ({ getFileAccessUrl: mocks.fileAccessUrl })),
+  FileService: vi.fn(function () {
+    return { getFileAccessUrl: mocks.fileAccessUrl };
+  }),
 }));
 vi.mock('../statusService', () => ({
-  VerifyStatusService: vi.fn(() => ({
-    markVerifying: mocks.statusMarkVerifying,
-    recompute: mocks.statusRecompute,
-  })),
+  VerifyStatusService: vi.fn(function () {
+    return {
+      markVerifying: mocks.statusMarkVerifying,
+      recompute: mocks.statusRecompute,
+    };
+  }),
 }));
 
 describe('VerifyExecutorService', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mocks.evidenceListByRun.mockResolvedValue([]);
+    mocks.documentFindByIds.mockResolvedValue([]);
     mocks.aiModelFind.mockResolvedValue({ abilities: { vision: false } });
     mocks.fileAccessUrl.mockResolvedValue('https://files.example/image.png');
     mocks.fileFindById.mockResolvedValue({
@@ -152,6 +172,45 @@ describe('VerifyExecutorService', () => {
     );
   });
 
+  it('points a missing run-evidence item at a submit command it can run as-is', async () => {
+    mocks.runEnsureForOperation.mockResolvedValue({
+      id: 'run-1',
+      plan: [
+        {
+          id: 'shot-check',
+          index: 0,
+          onFail: 'auto_repair',
+          required: true,
+          title: 'Screenshot',
+          verifierConfig: {
+            requiredEvidence: [{ modality: 'image', scope: 'run_evidence', type: 'screenshot' }],
+          },
+          verifierType: 'llm',
+        },
+      ],
+      planConfirmedAt: new Date(),
+    });
+
+    await new VerifyExecutorService({} as never, 'user-1').execute({
+      deliverable: 'ui change',
+      goal: 'verify ui',
+      modelConfig: { model: 'model', provider: 'provider' },
+      operationId: 'builder-op-shot',
+      runVerifierAgent: vi.fn().mockResolvedValue({ verifierOperationId: 'verifier-op-shot' }),
+    });
+
+    expect(mocks.resultUpdateByCheckItem).toHaveBeenCalledWith(
+      'run-1',
+      'shot-check',
+      expect.objectContaining({
+        suggestion: expect.stringContaining(
+          'lh acceptance run result submit --run run-1 --item shot-check',
+        ),
+        verdict: 'uncertain',
+      }),
+    );
+  });
+
   it('routes file-backed text evidence to an agent that can inspect the stored artifact', async () => {
     mocks.runEnsureForOperation.mockResolvedValue({
       id: 'run-1',
@@ -202,6 +261,52 @@ describe('VerifyExecutorService', () => {
       }),
     );
     expect(mocks.aiGenerateObject).not.toHaveBeenCalled();
+  });
+
+  it('hydrates document evidence content before sending it to the judge', async () => {
+    mocks.runEnsureForOperation.mockResolvedValue({
+      id: 'run-1',
+      plan: [
+        {
+          id: 'document-evidence',
+          index: 0,
+          required: true,
+          title: 'Supplier list',
+          verifierType: 'llm',
+        },
+      ],
+      planConfirmedAt: new Date(),
+    });
+    mocks.evidenceListByRun.mockResolvedValue([
+      {
+        checkItemId: 'document-evidence',
+        content: null,
+        documentId: 'docs_123',
+        type: 'markdown',
+      },
+    ]);
+    mocks.documentFindByIds.mockResolvedValue([
+      { content: '# Suppliers\n- Vendor A: $100', id: 'docs_123' },
+    ]);
+    mocks.resultListByRun.mockReset().mockResolvedValue([]);
+    mocks.aiGenerateObject.mockResolvedValue({
+      confidence: 1,
+      evidence: 'supplier and quote listed',
+      reasoning: 'document contains both fields',
+      verdict: 'passed',
+    });
+
+    await new VerifyExecutorService({} as never, 'user-1').execute({
+      deliverable: 'supplier report',
+      goal: 'find supplier quotes',
+      modelConfig: { model: 'model', provider: 'provider' },
+      operationId: 'builder-op-doc',
+    });
+
+    expect(mocks.documentFindByIds).toHaveBeenCalledWith(['docs_123']);
+    expect(mocks.aiGenerateObject.mock.calls[0][0].messages[1].content).toContain(
+      '# Suppliers\n- Vendor A: $100',
+    );
   });
 
   it('falls back to single-item judging when a batch omits a check id', async () => {
