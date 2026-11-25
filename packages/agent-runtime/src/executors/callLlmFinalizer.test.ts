@@ -598,6 +598,61 @@ describe('callLlmFinalizer', () => {
     expect(plainUpdate.metadata ?? {}).not.toHaveProperty('work');
   });
 
+  it('stamps the work display anchor when the tool interaction is nested in a parsed assistantGroup', async () => {
+    const messages = createMessageTransport();
+    // What the server runtime actually hands the finalizer: `state.messages` is
+    // `parse(...).flatList`, so a turn's tool calls live under
+    // `assistantGroup.children[].tools` — no `role: 'tool'` row and no
+    // top-level `tool_calls`.
+    const state = AgentRuntime.createInitialState({
+      messages: [
+        { content: 'Create a board', id: 'user-1', role: 'user' },
+        {
+          children: [
+            {
+              content: '',
+              id: 'assistant-0',
+              tools: [
+                {
+                  apiName: 'createArtboard',
+                  arguments: '{}',
+                  id: 'call-1',
+                  identifier: 'builtin-artboard',
+                  type: 'default',
+                },
+              ],
+            },
+          ],
+          content: '',
+          id: 'group-1',
+          role: 'assistantGroup',
+        },
+      ],
+      operationId: 'operation-1',
+      origin: { sourceMessageId: 'user-1' },
+    });
+
+    await finalizeCallLlmTurn({
+      assistantMessageId: 'assistant-1',
+      events: [],
+      host: createHost(messages),
+      model: 'gpt-4',
+      output: createOutput(),
+      provider: 'openai',
+      shouldReplayAssistantReasoning: false,
+      state,
+    });
+
+    expect(messages.update).toHaveBeenCalledWith(
+      'assistant-1',
+      expect.objectContaining({
+        metadata: expect.objectContaining({
+          work: { rootOperationId: 'operation-1', userMessageId: 'user-1' },
+        }),
+      }),
+    );
+  });
+
   it('serializes multimodal parts and keeps the null grounding sentinel', async () => {
     const messages = createMessageTransport();
     const state = AgentRuntime.createInitialState({ operationId: 'operation-1' });
@@ -634,7 +689,7 @@ describe('callLlmFinalizer', () => {
           { text: 'Image answer', type: 'text' },
           { image: 'https://example.com/image.png', type: 'image' },
         ]),
-        metadata: { isMultimodal: true },
+        metadata: { interruptedMidStream: false, isMultimodal: true },
         reasoning: {
           content: JSON.stringify([
             { text: 'Visual reasoning', type: 'text' },
@@ -676,10 +731,13 @@ describe('callLlmFinalizer', () => {
       state: AgentRuntime.createInitialState({ operationId: 'operation-1' }),
     });
 
+    // Before: a Stop mid-stream persisted the partial with no stopped marker,
+    // so after a refresh the turn read as finished. After: it carries one.
     expect(messages.update).toHaveBeenCalledWith(
       'assistant-1',
       expect.objectContaining({
-        metadata: { finishType: 'abort' },
+        content: 'Partial answer',
+        metadata: { finishType: 'abort', interruptedMidStream: true },
         observationId: 'observation-1',
         reasoning: { content: 'Reasoning', duration: 120, signature: 'signature-1' },
         traceId: 'trace-1',
@@ -692,6 +750,49 @@ describe('callLlmFinalizer', () => {
       },
       phase: 'human_abort',
     });
+  });
+
+  it('keeps the placeholder and marks a turn stopped before its first token', async () => {
+    const messages = createMessageTransport();
+
+    await finalizeCallLlmTurn({
+      assistantMessageId: 'assistant-1',
+      events: [],
+      host: createHost(messages),
+      model: 'claude',
+      output: createOutput({ content: '', finishReason: 'abort', thinkingContent: '' }),
+      provider: 'anthropic',
+      shouldReplayAssistantReasoning: false,
+      state: AgentRuntime.createInitialState({ operationId: 'operation-1' }),
+    });
+
+    const [, update] = vi.mocked(messages.update).mock.calls[0];
+    expect(update.content).toBeUndefined();
+    expect(update.metadata).toMatchObject({ interruptedMidStream: true });
+  });
+
+  // A row stopped earlier keeps `interruptedMidStream` when it is written again,
+  // because the message model merges metadata. A continuation that finished
+  // normally therefore still read as stopped.
+  //
+  // Before: the marker survived. After: a normal final write clears it.
+  it('clears the stopped marker when the row then finishes normally', async () => {
+    const messages = createMessageTransport();
+
+    await finalizeCallLlmTurn({
+      assistantMessageId: 'assistant-1',
+      events: [],
+      host: createHost(messages),
+      model: 'claude',
+      output: createOutput({ finishReason: 'stop' }),
+      provider: 'anthropic',
+      shouldReplayAssistantReasoning: false,
+      state: AgentRuntime.createInitialState({ operationId: 'operation-1' }),
+    });
+
+    const [, update] = vi.mocked(messages.update).mock.calls[0];
+    expect(update.content).toBe('Answer');
+    expect(update.metadata).toMatchObject({ interruptedMidStream: false });
   });
 
   it('records a client-executed attempt and its estimated usage on the message', async () => {
@@ -730,6 +831,52 @@ describe('callLlmFinalizer', () => {
       expect.objectContaining({
         metadata: { executionSite: 'client', interruptedMidStream: true },
       }),
+    );
+  });
+
+  it('persists the request accounting on final and interrupted assistant messages', async () => {
+    const contextAccounting = {
+      bySource: {
+        content: 120,
+        fileContext: 40,
+        reasoning: 10,
+        thoughtSignature: 0,
+        toolCallId: 4,
+        toolCalls: 20,
+        toolDefinition: 300,
+      },
+      estimator: 'tokenx' as const,
+      messageCount: 4,
+      system: 500,
+      total: 994,
+    };
+    const messages = createMessageTransport();
+
+    await finalizeCallLlmTurn({
+      assistantMessageId: 'assistant-final',
+      contextAccounting,
+      events: [],
+      host: createHost(messages),
+      model: 'gpt-4',
+      output: createOutput(),
+      provider: 'openai',
+      shouldReplayAssistantReasoning: false,
+      state: AgentRuntime.createInitialState({ operationId: 'operation-1' }),
+    });
+    expect(messages.update).toHaveBeenLastCalledWith(
+      'assistant-final',
+      expect.objectContaining({ metadata: expect.objectContaining({ contextAccounting }) }),
+    );
+
+    await persistInterruptedCallLlmResult({
+      assistantMessageId: 'assistant-interrupted',
+      contextAccounting,
+      host: createHost(messages),
+      output: createOutput({ content: 'Partial' }),
+    });
+    expect(messages.update).toHaveBeenLastCalledWith(
+      'assistant-interrupted',
+      expect.objectContaining({ metadata: expect.objectContaining({ contextAccounting }) }),
     );
   });
 

@@ -7,6 +7,7 @@ import { getTestDB } from '../../core/getTestDB';
 import {
   agentOperations,
   agents,
+  channelAgentGrants,
   channelJobs,
   channelMemberGrants,
   channelMembers,
@@ -336,7 +337,6 @@ describe('channel schema', () => {
         { userId: 'missing-user' },
         { userId: null, agentId: 'missing-agent', routingStatus: 'reply' as const },
         { userId: ownerId, agentId: first.agent.agentId },
-        { userId: null, agentId: first.agent.agentId },
         { userId: ownerId, routingStatus: 'reply' as const },
       ]) {
         await expect(
@@ -349,6 +349,25 @@ describe('channel schema', () => {
           }),
         ).rejects.toThrow();
       }
+    });
+
+    it('accepts a request an Agent wrote', async () => {
+      const first = await createChannel('First');
+      const message = await createMessage(first.channel.id, first.owner.id, 1);
+
+      const [request] = await serverDB
+        .insert(channelMessages)
+        .values({
+          ...message,
+          agentId: first.agent.agentId,
+          id: undefined,
+          requestKey: 'agent-request',
+          sequence: 2,
+          userId: null,
+        })
+        .returning();
+      expect(request).toMatchObject({ agentId: first.agent.agentId, userId: null });
+      expect(request.routingStatus).not.toBe('reply');
     });
 
     it('keeps Channel attachments unique and drops them with the file', async () => {
@@ -382,53 +401,15 @@ describe('channel schema', () => {
   });
 
   describe('writer locks', () => {
-    it('allows one writer per member until it is released or isolated', async () => {
-      const fixture = await createChannel();
-      const [job] = await createClaimedJob(fixture, 1, null);
-
-      await expect(createClaimedJob(fixture, 2, null)).rejects.toThrow();
-
-      await serverDB
-        .update(channelJobs)
-        .set({ isolatedAt: new Date() })
-        .where(eq(channelJobs.id, job.id));
-      await expect(createClaimedJob(fixture, 3, null)).resolves.toHaveLength(1);
-    });
-
-    it('serializes writers on one device directory across channels', async () => {
+    // One writer per member and branch, and per device directory, are application rules
+    // checked by `claimJob` (see the repository's execution tests), not database constraints.
+    it('leaves writer exclusivity to the application', async () => {
       const first = await createChannel('First');
       const second = await createChannel('Second');
-      const [job] = await createClaimedJob(first, 1);
+      await createClaimedJob(first, 1);
 
-      await expect(createClaimedJob(second, 1)).rejects.toThrow();
-      await expect(
-        createClaimedJob(second, 2, { deviceId: 'device-1', workingDirectory: '/other' }),
-      ).resolves.toHaveLength(1);
-
-      await serverDB
-        .update(channelJobs)
-        .set({ writerHeld: false })
-        .where(eq(channelJobs.id, job.id));
-      const third = await createChannel('Third');
-      await expect(createClaimedJob(third, 1)).resolves.toHaveLength(1);
-    });
-
-    it('keeps the directory locked while an isolated writer is still unconfirmed', async () => {
-      const first = await createChannel('First');
-      const second = await createChannel('Second');
-      const [job] = await createClaimedJob(first, 1);
-
-      await serverDB
-        .update(channelJobs)
-        .set({ isolatedAt: new Date() })
-        .where(eq(channelJobs.id, job.id));
-      await expect(createClaimedJob(second, 1)).rejects.toThrow();
-
-      await serverDB
-        .update(channelJobs)
-        .set({ writerHeld: false })
-        .where(eq(channelJobs.id, job.id));
-      await expect(createClaimedJob(second, 2)).resolves.toHaveLength(1);
+      await expect(createClaimedJob(first, 2)).resolves.toHaveLength(1);
+      await expect(createClaimedJob(second, 1)).resolves.toHaveLength(1);
     });
   });
 
@@ -453,6 +434,95 @@ describe('channel schema', () => {
       await expect(
         serverDB.insert(channelMemberGrants).values({ ...grant, workingDirectory: '/other' }),
       ).rejects.toThrow();
+    });
+  });
+
+  describe('agent grants', () => {
+    const createGuest = async (channelId: string) => {
+      const [guest] = await serverDB
+        .insert(channelMembers)
+        .values({ actorType: 'user', channelId, role: 'member', userId: otherId })
+        .returning();
+      return guest;
+    };
+
+    const createThread = async (channelId: string, authorMemberId: string, sequence: number) => {
+      const root = await createMessage(channelId, authorMemberId, sequence);
+      const [thread] = await serverDB
+        .insert(channelThreads)
+        .values({ channelId, rootMessageId: root.id, rootSequence: sequence })
+        .returning();
+      return thread;
+    };
+
+    it('keeps one live grant per scope and history for decided ones', async () => {
+      const { agent, channel, owner } = await createChannel();
+      const guest = await createGuest(channel.id);
+      const thread = await createThread(channel.id, owner.id, 1);
+      const base = { channelId: channel.id, memberId: agent.id, ownerId };
+
+      const [whole] = await serverDB.insert(channelAgentGrants).values(base).returning();
+      expect(whole.status).toBe('pending');
+      expect(whole.metadata).toEqual({});
+      await expect(serverDB.insert(channelAgentGrants).values(base)).rejects.toThrow();
+
+      // Each narrower scope is its own grant.
+      await expect(
+        serverDB.insert(channelAgentGrants).values([
+          { ...base, granteeMemberId: guest.id },
+          { ...base, threadId: thread.id },
+          { ...base, granteeMemberId: guest.id, threadId: thread.id },
+        ]),
+      ).resolves.toBeDefined();
+      await expect(
+        serverDB
+          .insert(channelAgentGrants)
+          .values({ ...base, granteeMemberId: guest.id, threadId: thread.id }),
+      ).rejects.toThrow();
+
+      // A revoked grant frees its scope for a fresh request.
+      await serverDB
+        .update(channelAgentGrants)
+        .set({ revokeReason: 'revoked_by_owner', revokedAt: new Date(), status: 'revoked' })
+        .where(eq(channelAgentGrants.id, whole.id));
+      await expect(serverDB.insert(channelAgentGrants).values(base)).resolves.toBeDefined();
+    });
+
+    it('binds the member, grantee and Thread to the same channel', async () => {
+      const { agent, channel } = await createChannel('First');
+      const other = await createChannel('Second');
+      const strangerThread = await createThread(other.channel.id, other.owner.id, 1);
+      const base = { channelId: channel.id, memberId: agent.id, ownerId };
+
+      await expect(
+        serverDB.insert(channelAgentGrants).values({ ...base, memberId: other.agent.id }),
+      ).rejects.toThrow();
+      await expect(
+        serverDB.insert(channelAgentGrants).values({ ...base, granteeMemberId: other.owner.id }),
+      ).rejects.toThrow();
+      await expect(
+        serverDB.insert(channelAgentGrants).values({ ...base, threadId: strangerThread.id }),
+      ).rejects.toThrow();
+    });
+
+    it('drops grants with the grantee or the Thread they cover', async () => {
+      const { agent, channel, owner } = await createChannel();
+      const guest = await createGuest(channel.id);
+      const thread = await createThread(channel.id, owner.id, 1);
+      const base = { channelId: channel.id, memberId: agent.id, ownerId };
+      await serverDB.insert(channelAgentGrants).values([
+        { ...base, granteeMemberId: guest.id },
+        { ...base, threadId: thread.id },
+      ]);
+
+      await serverDB.delete(channelMembers).where(eq(channelMembers.id, guest.id));
+      await serverDB.delete(channelThreads).where(eq(channelThreads.id, thread.id));
+
+      const rest = await serverDB
+        .select()
+        .from(channelAgentGrants)
+        .where(eq(channelAgentGrants.channelId, channel.id));
+      expect(rest).toHaveLength(0);
     });
   });
 

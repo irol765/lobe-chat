@@ -15,32 +15,20 @@ import { useActiveWorkspaceId } from '@/business/client/hooks/useActiveWorkspace
 import UserAvatar from '@/components/UserAvatar';
 import { formatSize } from '@/utils/format';
 
-import type { DriveUsageRefreshResult, useDriveUsage } from './useDriveData';
+import CleanupEntryButton from './Cleanup/CleanupEntryButton';
+import {
+  type DriveUsageRefreshResult,
+  MAX_MEASURE_CALLS,
+  MEASURE_CALL_GAP_MS,
+  pageHidden,
+  type useDriveUsage,
+  wait,
+} from './useDriveData';
 
 /** The market's code for a usage refresh whose walk did not finish. */
 const USAGE_MEASURE_FAILED = 'STORAGE_USAGE_MEASURE_FAILED';
 
 type DriveUsageData = NonNullable<ReturnType<typeof useDriveUsage>['data']>;
-
-/**
- * How many refresh calls one click keeps going for while a large drive is
- * still being measured. Each call walks for up to about half a minute on the
- * server, so this follows a walk for several minutes; past it, the measurement
- * cron finishes the walk and the next visit shows the result.
- */
-const MAX_MEASURE_CALLS = 12;
-
-/**
- * Pause between those calls. A call normally spends its time walking on the
- * server; when another caller holds the walk it answers at once, and without
- * a pause the loop would spend all its calls in a second.
- */
-const MEASURE_CALL_GAP_MS = 3000;
-
-const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-
-/** Nobody is looking: the measurement cron finishes the walk without this tab. */
-const pageHidden = () => typeof document !== 'undefined' && document.visibilityState === 'hidden';
 
 /** How many members the ranking shows before it folds the rest away. */
 const MEMBERS_FOLDED = 5;
@@ -159,8 +147,8 @@ export const UsageBreakdown = memo<{
   // Which refresh is running, and in which workspace: the spinner belongs to
   // that workspace, and only that refresh may clear it.
   const [busy, setBusy] = useState<{ token: object; workspaceId: string | null } | null>(null);
-  // A drive too large to measure in one call (LOBE-15436): how much the walk
-  // has counted so far, shown beside the last finished figure.
+  // A drive too large to measure in one call: how much the walk has counted
+  // so far, shown beside the last finished figure.
   const [measurement, setMeasurement] = useState<{
     progress: NonNullable<DriveUsageRefreshResult['measuring']>;
     workspaceId: string | null;
@@ -261,7 +249,7 @@ export const UsageBreakdown = memo<{
       setMeasuring(null);
       // The execution plane could not walk the drive, so the figure on screen
       // is the last one it measured — say so, rather than let a refresh that
-      // changed nothing pass for one that confirmed it (LOBE-15436).
+      // changed nothing pass for one that confirmed it.
       toast.error(
         (error as { message?: string } | undefined)?.message === USAGE_MEASURE_FAILED
           ? t('drive.usage.refreshFailed')
@@ -479,8 +467,14 @@ export const UsageBreakdown = memo<{
           {t(refused ? 'drive.usage.over' : 'drive.usage.overBilled')}
         </Text>
       )}
-      {/* While writes are refused, the way to keep saving — not only the fact. */}
-      {refused && <SandboxStorageOverQuotaAction />}
+      {/* While writes are refused, the ways to keep saving — not only the fact:
+          free up space, or let the plan take more. */}
+      {refused && (
+        <Flexbox horizontal align={'center'} gap={8} wrap={'wrap'}>
+          <CleanupEntryButton />
+          <SandboxStorageOverQuotaAction />
+        </Flexbox>
+      )}
     </Flexbox>
   );
 });

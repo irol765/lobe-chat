@@ -1,7 +1,12 @@
 import type { ChannelContextMessage, ChannelInputManifest } from '@lobechat/types';
 import { describe, expect, it } from 'vitest';
 
-import { buildChannelPrompt, CHANNEL_INSTRUCTIONS, CHANNEL_REPLY_GUIDELINES } from './channel';
+import {
+  buildChannelPrompt,
+  CHANNEL_INSTRUCTIONS,
+  CHANNEL_REPLY_GUIDELINES,
+  projectChannelHistory,
+} from './channel';
 
 describe('Channel request prompt', () => {
   it('includes the public-reply policy with the technical-detail exception', () => {
@@ -31,6 +36,40 @@ describe('Channel request prompt', () => {
   ): ChannelContextMessage => ({ author, content, id, sequence: 0, threadId: null, ...extra });
   const caller = { id: 'caller', name: 'Mia', type: 'user' } as const;
   const coder = { id: 'coder', name: 'Coder', type: 'agent' } as const;
+
+  it('asks for one answer to requests the same person sent in a row', () => {
+    const prompt = buildChannelPrompt(
+      { ...manifest, requestMessageIds: ['first', 'current'] },
+      [
+        message('quoted', 'The plan', coder),
+        message('first', 'Fix the list', caller, { replyToId: 'quoted' }),
+        message('current', 'Only the queued items', caller),
+      ],
+      {
+        boundary: 'b0',
+        // The earlier request is also unseen context; it is shown once, as a request.
+        context: [message('first', 'Fix the list', caller), message('theirs', 'Ok', coder)],
+      },
+    );
+
+    expect(prompt.split('\n')).toEqual([
+      '<channel_message from="Coder" type="agent" boundary="b0">',
+      'Ok',
+      '</channel_message boundary="b0">',
+      '<channel_quote from="Coder" type="agent" boundary="b0">',
+      'The plan',
+      '</channel_quote boundary="b0">',
+      '<channel_request from="Mia" type="user" to="Codex" boundary="b0">',
+      'Fix the list',
+      '</channel_request boundary="b0">',
+      '<channel_request from="Mia" type="user" to="Codex" boundary="b0">',
+      'Only the queued items',
+      '</channel_request boundary="b0">',
+      '<channel_merged boundary="b0">',
+      'The 2 `channel_request` blocks are requests the same person sent in a row while you were busy, oldest first. Answer them together in one reply. Where a later one corrects, narrows or replaces an earlier one, follow the later one.',
+      '</channel_merged boundary="b0">',
+    ]);
+  });
 
   it('marks the member’s own earlier replies and says how much unseen history is left out', () => {
     const self = { id: 'agent', name: 'Codex', type: 'agent' } as const;
@@ -99,6 +138,61 @@ describe('Channel request prompt', () => {
     ).not.toMatch(/channel_reply|asked to answer this request first/);
   });
 
+  it('tells a run it already acknowledged the request, after the request', () => {
+    const request = [message('current', 'Why did the deploy fail?', caller)];
+    const prompt = buildChannelPrompt(manifest, request, {
+      boundary: 'b0',
+      opening: 'Got it, checking the deploy logs first.',
+    });
+
+    expect(prompt.indexOf('<channel_opening boundary="b0">')).toBeGreaterThan(
+      prompt.indexOf('</channel_request boundary="b0">'),
+    );
+    expect(prompt).toContain('"Got it, checking the deploy logs first."');
+    expect(prompt).toContain('Do not acknowledge again');
+    expect(buildChannelPrompt(manifest, request, { boundary: 'b0' })).not.toContain(
+      '<channel_opening',
+    );
+  });
+
+  it('tells a resumed run to continue its stopped turn, without context it already read', () => {
+    const request = [message('current', 'Why did the deploy fail?', caller)];
+    const prompt = buildChannelPrompt(manifest, request, {
+      boundary: 'b0',
+      context: [message('earlier', 'Deploy is red again', caller)],
+      omitted: 4,
+      opening: 'Got it, checking the deploy logs first.',
+      resume: { reason: 'Coder stopped making progress' },
+    });
+
+    expect(prompt.split('\n')[0]).toBe(
+      '<channel_request from="Mia" type="user" to="Codex" boundary="b0">',
+    );
+    expect(prompt).toContain('<channel_resume boundary="b0">');
+    expect(prompt).toContain('(Coder stopped making progress)');
+    expect(prompt).toContain('Continue from where you left off');
+    expect(prompt).not.toContain('Deploy is red again');
+    expect(prompt).not.toContain('<channel_gap');
+    expect(prompt).not.toContain('<channel_opening');
+  });
+
+  it('tells a run which other Agents the request asked, so the answers divide the work', () => {
+    const request = [message('current', 'How do we close the SEO-to-revenue loop?', caller)];
+    const prompt = buildChannelPrompt(manifest, request, {
+      boundary: 'b0',
+      peers: ['Analyst (Data analyst)'],
+    });
+
+    expect(prompt).toMatch(
+      /<\/channel_request boundary="b0">\n<channel_peers boundary="b0">\nThis request also asked Analyst \(Data analyst\) to answer\./,
+    );
+    expect(prompt).toContain('answer only the part your own role owns');
+    expect(CHANNEL_INSTRUCTIONS).toContain('channel_peers');
+    expect(buildChannelPrompt(manifest, request, { boundary: 'b0' })).not.toContain(
+      '<channel_peers',
+    );
+  });
+
   it('renders the unseen context and the request as attributed blocks without ids', () => {
     const prompt = buildChannelPrompt(
       manifest,
@@ -115,6 +209,33 @@ describe('Channel request prompt', () => {
         '</channel_request boundary="b0">',
       ].join('\n'),
     );
+  });
+
+  it('names the Agent that relayed a request from another Channel', () => {
+    const relayed = message('current', 'Please take a look', caller, {
+      via: { agentId: 'agent-relayer', name: 'Project Agent' },
+    });
+    expect(buildChannelPrompt(manifest, [relayed], { boundary: 'b0' })).toContain(
+      '<channel_request from="Mia" type="user" via="Project Agent" to="Codex" boundary="b0">',
+    );
+    expect(
+      projectChannelHistory({
+        cutoffSequence: 1,
+        messages: [{ ...relayed, contentLength: 18, truncated: false }],
+        nextBeforeSequence: null,
+      }).messages[0],
+    ).toMatchObject({ via: 'Project Agent' });
+  });
+
+  it('marks a relayed reply brought back to the Agent that relayed the message', () => {
+    const receipt = message('current', 'Taking it', caller, {
+      receipt: { channelId: 'channel-platform', channelTitle: 'Platform', messageId: 'reply-1' },
+      via: { agentId: 'agent-answerer', name: 'Answerer' },
+    });
+    expect(buildChannelPrompt(manifest, [receipt], { boundary: 'b0' })).toContain(
+      '<channel_request from="Mia" type="user" via="Answerer" reply_from="#Platform" to="Codex" boundary="b0">',
+    );
+    expect(CHANNEL_INSTRUCTIONS).toContain('do not relay it again');
   });
 
   it('points at the full message only when the excerpt is not enough', () => {

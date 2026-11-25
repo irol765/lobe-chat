@@ -1,13 +1,10 @@
 import { ENABLE_TOOL_CHANNEL_SETTINGS } from '@lobechat/business-const';
-import { SkillsIcon } from '@lobehub/ui/icons';
 import {
   AppWindowIcon,
-  Blocks,
   Brain,
   BrainCircuit,
   ChartColumnBigIcon,
   ChartPieIcon,
-  Coins,
   CreditCard,
   Database,
   EllipsisIcon,
@@ -35,7 +32,6 @@ import {
 } from '@/store/serverConfig';
 import { useUserStore } from '@/store/user';
 import { labPreferSelectors } from '@/store/user/selectors';
-import { userGeneralSettingsSelectors } from '@/store/user/slices/settings/selectors';
 
 export enum SettingsGroupKey {
   Agent = 'agent',
@@ -60,7 +56,8 @@ export const useCategory = (): CategoryGroup[] => {
   const { t } = useTranslation(['setting', 'auth', 'subscription']);
   const { hideDocs, showApiKeyManage, showProvider } = useServerConfigStore(featureFlagsSelectors);
   const enableBusinessFeatures = useServerConfigStore(serverConfigSelectors.enableBusinessFeatures);
-  const isDevMode = useUserStore((s) => userGeneralSettingsSelectors.config(s).isDevMode);
+  // Advanced only holds gateway mode on mobile; without it the page is empty.
+  const enableGatewayMode = useServerConfigStore(serverConfigSelectors.enableGatewayMode);
   const enableOAuthApps = useUserStore(labPreferSelectors.enableOAuthApps);
 
   return useMemo(() => {
@@ -88,12 +85,7 @@ export const useCategory = (): CategoryGroup[] => {
           makeItem({
             icon: ChartPieIcon,
             key: SettingsTabs.Usage,
-            label: t('setting:tab.usage'),
-          }),
-          makeItem({
-            icon: Coins,
-            key: SettingsTabs.Credits,
-            label: t('subscription:tab.credits'),
+            label: t('subscription:tab.usage'),
           }),
           makeItem({
             icon: CreditCard,
@@ -118,7 +110,6 @@ export const useCategory = (): CategoryGroup[] => {
         key: SettingsTabs.ServiceModel,
         label: t('setting:tab.serviceModel'),
       }),
-      makeItem({ icon: SkillsIcon, key: SettingsTabs.Skill, label: t('setting:tab.skill') }),
       makeItem({ icon: TagIcon, key: SettingsTabs.Labels, label: t('setting:tab.labels') }),
       makeItem({ icon: BrainCircuit, key: SettingsTabs.Memory, label: t('setting:tab.memory') }),
       ENABLE_TOOL_CHANNEL_SETTINGS &&
@@ -126,18 +117,18 @@ export const useCategory = (): CategoryGroup[] => {
     ].filter((item): item is CategoryItem => Boolean(item));
 
     const connection: CategoryItem[] = [
-      makeItem({ icon: Blocks, key: SettingsTabs.Connector, label: t('setting:tab.connector') }),
       makeItem({ icon: KeyRound, key: SettingsTabs.Creds, label: t('setting:tab.creds') }),
     ];
 
     const system: CategoryItem[] = [
       makeItem({ icon: Database, key: SettingsTabs.Storage, label: t('setting:tab.storage') }),
-      makeItem({
-        icon: EllipsisIcon,
-        key: SettingsTabs.Advanced,
-        label: t('setting:tab.advanced'),
-      }),
-      (showApiKeyManage || isDevMode) &&
+      enableGatewayMode &&
+        makeItem({
+          icon: EllipsisIcon,
+          key: SettingsTabs.Advanced,
+          label: t('setting:tab.advanced'),
+        }),
+      showApiKeyManage &&
         makeItem({ icon: KeyIcon, key: SettingsTabs.APIKey, label: t('auth:tab.apikey') }),
       enableOAuthApps &&
         makeItem({
@@ -165,8 +156,8 @@ export const useCategory = (): CategoryGroup[] => {
     hideDocs,
     showApiKeyManage,
     showProvider,
-    isDevMode,
     enableOAuthApps,
+    enableGatewayMode,
     navigate,
   ]);
 };

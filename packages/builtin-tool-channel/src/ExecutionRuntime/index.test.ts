@@ -87,3 +87,118 @@ describe('Channel model-facing history', () => {
     });
   });
 });
+
+describe('Channel messaging', () => {
+  const history = { readMessage: vi.fn(), readMessages: vi.fn() };
+
+  it('returns the directory and the posted message as content and state', async () => {
+    const directory = {
+      channels: [
+        {
+          agents: [{ agentId: 'agent-lobehub', description: null, name: 'LobeHub Agent' }],
+          current: false,
+          id: 'channel-lobehub',
+          kind: 'group' as const,
+          projectId: null,
+          title: 'General',
+        },
+      ],
+      hasMore: false,
+    };
+    const sent = {
+      agents: [{ agentId: 'agent-lobehub', name: 'LobeHub Agent' }],
+      channelId: 'channel-lobehub',
+      channelTitle: 'General',
+      messageId: 'message-sent',
+      url: 'https://example.com/channels/channel-lobehub',
+    };
+    const messaging = {
+      listChannels: vi.fn().mockResolvedValue(directory),
+      sendMessage: vi.fn().mockResolvedValue(sent),
+    };
+    const runtime = new ChannelExecutionRuntime(history, messaging);
+
+    const listed = await runtime.listChannels({ agentId: 'agent-lobehub' });
+    expect(messaging.listChannels).toHaveBeenCalledWith({ agentId: 'agent-lobehub' });
+    expect(listed).toMatchObject({ state: directory, success: true });
+    expect(JSON.parse(listed.content!)).toEqual(directory);
+
+    const params = { agentIds: ['agent-lobehub'], channelId: 'channel-lobehub', content: 'Hi' };
+    const result = await runtime.sendMessage(params);
+    expect(messaging.sendMessage).toHaveBeenCalledWith(params);
+    expect(result).toMatchObject({ state: sent, success: true });
+  });
+
+  it('reports a refused send, and a run without messaging', async () => {
+    const runtime = new ChannelExecutionRuntime(history, {
+      listChannels: vi.fn(),
+      sendMessage: vi.fn().mockRejectedValue(new Error('Not an Agent member of "General"')),
+    });
+    expect(
+      await runtime.sendMessage({ agentIds: ['x'], channelId: 'c', content: 'Hi' }),
+    ).toMatchObject({
+      content: 'Not an Agent member of "General"',
+      error: { type: 'ChannelMessagingError' },
+      success: false,
+    });
+    expect(await new ChannelExecutionRuntime(history).listChannels()).toMatchObject({
+      error: { type: 'ChannelMessagingError' },
+      success: false,
+    });
+  });
+});
+
+describe('Channel askUser', () => {
+  const questions = [{ options: [{ label: 'A' }, { label: 'B' }], question: 'Which?' }];
+
+  it('holds the questions and tells the run to end its turn instead of waiting', async () => {
+    const askUser = vi.fn().mockResolvedValue({ questions: 1, status: 'posts_with_reply' });
+    const runtime = new ChannelExecutionRuntime({
+      askUser,
+      readMessage: vi.fn(),
+      readMessages: vi.fn(),
+    });
+    const result = await runtime.askUser({ questions });
+    expect(askUser).toHaveBeenCalledWith({ questions });
+    expect(result).toMatchObject({ state: { status: 'posts_with_reply' }, success: true });
+    expect(result.content).toContain('End your turn now');
+  });
+
+  it('reports a refused ask as a tool error the model can correct', async () => {
+    const runtime = new ChannelExecutionRuntime({
+      askUser: vi.fn().mockRejectedValue(new Error('Question 1 has duplicate options')),
+      readMessage: vi.fn(),
+      readMessages: vi.fn(),
+    });
+    expect(await runtime.askUser({ questions })).toMatchObject({
+      content: 'Question 1 has duplicate options',
+      error: { type: 'ChannelAskError' },
+      success: false,
+    });
+  });
+});
+
+describe('Channel connector requests', () => {
+  it('posts the card and tells the Agent the connector comes next turn', async () => {
+    const requestConnector = vi
+      .fn()
+      .mockResolvedValue({ messageId: 'msg', name: 'GitHub', source: 'lobehub' });
+    const runtime = new ChannelExecutionRuntime({
+      readMessage: vi.fn(),
+      readMessages: vi.fn(),
+      requestConnector,
+    });
+    const result = await runtime.requestConnector({ identifier: 'github' });
+    expect(requestConnector).toHaveBeenCalledWith({ identifier: 'github' });
+    expect(result).toMatchObject({ state: { messageId: 'msg' }, success: true });
+    expect(result.content).toContain('next turn');
+  });
+
+  it('fails as a tool error when the run cannot post one', async () => {
+    const runtime = new ChannelExecutionRuntime({ readMessage: vi.fn(), readMessages: vi.fn() });
+    expect(await runtime.requestConnector({ identifier: 'github' })).toMatchObject({
+      error: { type: 'ChannelConnectorError' },
+      success: false,
+    });
+  });
+});

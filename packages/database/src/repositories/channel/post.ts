@@ -1,10 +1,10 @@
-import type { ChannelMessageMetadata } from '@lobechat/types';
+import type { ChannelMessageKind, ChannelMessageMetadata } from '@lobechat/types';
 import { and, eq } from 'drizzle-orm';
 
 import type { ChannelMessageItem } from '../../schemas';
 import { channelMembers, channelMessages } from '../../schemas';
 import type { Transaction } from '../../type';
-import { appendMessage } from './delivery';
+import { appendMessage, findThread } from './delivery';
 import { ChannelError } from './error';
 import { audit } from './transaction';
 
@@ -12,14 +12,18 @@ export interface ChannelAgentPostInput {
   /** The Agent that wrote it; must be an active member of the Channel. */
   agentId: string;
   content: string;
+  /** What the message is; its payload goes in `metadata.<kind>`. Default `text`. */
+  kind?: ChannelMessageKind;
   metadata?: ChannelMessageMetadata;
   /** Identity of what produced the post (e.g. the run). Posting it again returns the stored one. */
   requestKey: string;
+  /** The Thread to post in; one that is gone or closed falls back to the main timeline. */
+  threadId?: string | null;
 }
 
 /**
  * Posts a message an Agent wrote outside any Channel job — what it found after something
- * outside the Channel woke it — at the end of the main timeline. Stored like a published reply
+ * outside the Channel woke it — at the end of the main timeline or the given Thread. Stored like a published reply
  * that answers no request, so it reads as the Agent's and wakes no one.
  *
  * Expects the caller to hold the Channel lock.
@@ -42,7 +46,7 @@ export const postAgentMessage = async (
   if (existing) return existing;
 
   const [member] = await tx
-    .select({ id: channelMembers.id })
+    .select({ config: channelMembers.config, id: channelMembers.id })
     .from(channelMembers)
     .where(
       and(
@@ -54,14 +58,19 @@ export const postAgentMessage = async (
     )
     .limit(1);
   if (!member) throw new ChannelError('CONFLICT', 'The Agent is not a member of this Channel');
+  if (member.config?.muted)
+    throw new ChannelError('CONFLICT', 'The Agent is muted in this Channel');
 
+  const thread = await findThread(tx, channelId, input.threadId);
   const message = await appendMessage(tx, {
     agentId: input.agentId,
     channelId,
     content: input.content,
+    ...(input.kind && { kind: input.kind }),
     metadata: input.metadata ?? {},
     requestKey: input.requestKey,
     routingStatus: 'reply',
+    threadId: thread?.status === 'archived' ? null : (thread?.id ?? null),
   });
   await audit(tx, channelId, 'agent_posted', member.id, { messageId: message.id });
 

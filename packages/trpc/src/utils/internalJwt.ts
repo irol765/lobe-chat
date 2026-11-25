@@ -28,12 +28,14 @@ export const HETERO_OPERATION_JWT_PURPOSE = 'hetero-operation';
 
 export type HeteroOperationCapability =
   | 'acceptance:evidence'
+  | 'channel:message'
   | 'channel:read'
   | 'goal:manage'
   | 'hetero:finish'
   | 'hetero:ingest'
   | 'hetero:intervention:read'
-  | 'model:invoke';
+  | 'model:invoke'
+  | 'work:write';
 
 export interface HeteroOperationJwtClaims {
   aud: typeof HETERO_OPERATION_JWT_AUDIENCE;
@@ -231,12 +233,14 @@ export const validateHeteroOperationClaims = (
     !capabilities.every((capability) =>
       [
         'acceptance:evidence',
+        'channel:message',
         'channel:read',
         'goal:manage',
         'model:invoke',
         'hetero:ingest',
         'hetero:finish',
         'hetero:intervention:read',
+        'work:write',
       ].includes(capability as string),
     ) ||
     (payload.model !== undefined && typeof payload.model !== 'string') ||

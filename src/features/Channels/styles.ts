@@ -1,6 +1,9 @@
 import { cssVar } from '@lobehub/ui/stylex/cssVar.stylex';
 import * as stylex from '@stylexjs/stylex';
 
+import { densityTokens } from '@/styles/density.stylex';
+import { mentionTokens } from '@/styles/mention.stylex';
+
 const HOVER = '@media (hover: hover)';
 
 export const styles = stylex.create({
@@ -74,12 +77,15 @@ export const styles = stylex.create({
     paddingBlockStart: 8,
     paddingBlockEnd: 24,
   },
-  /** One message row; hovering highlights it and reveals its toolbar, like a chat app. */
+  /**
+   * One message row; hovering highlights it and reveals its toolbar, like a chat app.
+   * The wash spans the feed edge to edge (cancelling the feed's 16px padding), square,
+   * so it reads as a list row rather than a floating card.
+   */
   messageRow: {
     position: 'relative',
-    marginInline: -12,
-    paddingInline: 12,
-    borderRadius: cssVar.borderRadiusLG,
+    marginInline: -16,
+    paddingInline: densityTokens['--lobe-density-card-padding'],
     backgroundColor: {
       default: 'transparent',
       [HOVER]: { 'default': 'transparent', ':hover': cssVar.colorFillQuaternary },
@@ -95,7 +101,7 @@ export const styles = stylex.create({
   },
   // A continuation has no header for its toolbar; reserve room for both actions.
   continuationWithAction: {
-    paddingInlineEnd: 84,
+    paddingInlineEnd: 88,
   },
   messageTime: {
     flexShrink: 0,
@@ -109,7 +115,7 @@ export const styles = stylex.create({
   continuationTime: {
     position: 'absolute',
     insetBlockStart: 4,
-    insetInlineStart: 0,
+    insetInlineStart: 4,
     width: 54,
     textAlign: 'center',
     opacity: {
@@ -126,15 +132,27 @@ export const styles = stylex.create({
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'center',
-    paddingBlock: 12,
+    paddingBlock: densityTokens['--lobe-density-content-gap'],
     fontSize: cssVar.fontSizeSM,
     color: cssVar.colorTextSecondary,
   },
   /** Floats over the row's top-right corner while the row is hovered or focused. */
+  /** A member row's "more" button: shown on row hover or focus where hover exists. */
+  memberActions: {
+    flex: 'none',
+    opacity: {
+      default: 1,
+      [HOVER]: {
+        default: 0,
+        [stylex.when.ancestor(':hover')]: 1,
+        [stylex.when.ancestor(':focus-within')]: 1,
+      },
+    },
+  },
   messageToolbar: {
     position: 'absolute',
     insetBlockStart: 6,
-    insetInlineEnd: 12,
+    insetInlineEnd: 16,
     zIndex: 1,
     display: 'flex',
     alignItems: 'center',
@@ -187,23 +205,23 @@ export const styles = stylex.create({
     minWidth: 0,
     overflowWrap: 'anywhere',
   },
-  /** A mentioned member inside message text. */
+  /** A mentioned member inside message text; blue-violet so it never reads as a link. */
   mention: {
     paddingBlock: 1,
     paddingInline: 4,
     borderRadius: 4,
     fontWeight: 500,
-    color: cssVar.colorInfo,
-    backgroundColor: cssVar.colorInfoBg,
+    color: mentionTokens.color,
+    backgroundColor: mentionTokens.bg,
   },
   /** A mention inside the composer: highlighted text, no tag; tinted like selected text while selected. */
   composerMention: {
     userSelect: 'none',
     fontWeight: 500,
-    color: cssVar.colorInfo,
+    color: mentionTokens.color,
     // `.selected` is added by the editor's selection observer, not by React.
     borderRadius: { 'default': null, ':is(.selected)': cssVar.borderRadiusXS },
-    backgroundColor: { 'default': null, ':is(.selected)': cssVar.colorInfoBgHover },
+    backgroundColor: { 'default': null, ':is(.selected)': mentionTokens.bg },
   },
   composer: {
     'position': 'relative',
@@ -225,7 +243,7 @@ export const styles = stylex.create({
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'space-between',
-    gap: 12,
+    gap: densityTokens['--lobe-density-content-gap'],
     minWidth: 0,
     minHeight: 24,
     paddingInline: 4,
@@ -245,20 +263,19 @@ export const styles = stylex.create({
     flex: '1',
     minWidth: 0,
     maxHeight: 240,
-    // Buttons sit on the last line; the glyphs ride about 1.5px high in the line box,
-    // so drop the text that much to center it on the 28px icons beside it. Layout snaps
-    // text to whole pixels, so only a transform can move it the half pixel.
-    transform: 'translateY(1.5px)',
+    // Buttons sit on the last line; glyphs ride high in the line box, so drop the
+    // text 1px to center it on the 28px icons beside it.
+    marginBlockEnd: -1,
   },
   /** Takes the composer's place while the channel or thread is archived. */
   archivedNotice: {
     display: 'flex',
     alignItems: 'center',
     justifyContent: 'space-between',
-    gap: 12,
+    gap: densityTokens['--lobe-density-content-gap'],
     marginBlockEnd: 12,
     paddingBlock: 8,
-    paddingInline: 16,
+    paddingInline: densityTokens['--lobe-density-card-padding'],
     borderWidth: 1,
     borderStyle: 'solid',
     borderColor: cssVar.colorBorderSecondary,
@@ -294,20 +311,6 @@ export const statusStyles = stylex.create({
     height: 6,
     borderRadius: '50%',
     backgroundColor: 'currentcolor',
-  },
-  /** A bare red dot beside a message whose reply failed. */
-  failureMark: {
-    display: 'inline-flex',
-    alignItems: 'center',
-    justifyContent: 'center',
-    width: 18,
-    height: 18,
-    padding: 0,
-    borderWidth: 0,
-    borderRadius: '50%',
-    color: cssVar.colorError,
-    cursor: 'pointer',
-    backgroundColor: { 'default': 'transparent', ':hover': cssVar.colorErrorBg },
   },
   failureButton: {
     flex: 'none',
@@ -399,14 +402,6 @@ export const activityStyles = stylex.create({
     height: 24,
     paddingInline: 4,
     color: cssVar.colorTextSecondary,
-  },
-  /** Beside the Agent's name in a direct conversation's header. */
-  header: {
-    color: cssVar.colorTextDescription,
-  },
-  headerButton: {
-    height: 22,
-    paddingInline: 4,
   },
   avatars: {
     display: 'inline-flex',

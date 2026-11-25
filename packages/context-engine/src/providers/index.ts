@@ -8,6 +8,7 @@ export { AgentBuilderContextInjector } from './AgentBuilderContextInjector';
 export {
   AGENT_DOCUMENT_INJECTION_POSITIONS,
   AgentDocumentBeforeSystemInjector,
+  AgentDocumentChangesInjector,
   AgentDocumentContextInjector,
   AgentDocumentMessageInjector,
   AgentDocumentSystemAppendInjector,
@@ -63,7 +64,11 @@ export { SystemRoleInjector } from './SystemRoleInjector';
 export { TaskManagerContextInjector } from './TaskManagerContextInjector';
 export { TodoInjector } from './TodoInjector';
 export { ToolDiscoveryProvider } from './ToolDiscoveryProvider';
-export { selectToolPromptManifests, ToolSystemRoleProvider } from './ToolSystemRole';
+export {
+  renderToolInstructions,
+  selectToolPromptManifests,
+  ToolSystemRoleProvider,
+} from './ToolSystemRole';
 export { TopicReferenceContextInjector } from './TopicReferenceContextInjector';
 export { UserMemoryInjector } from './UserMemoryInjector';
 export { WorkspaceContextInjector } from './WorkspaceContextInjector';
@@ -78,7 +83,10 @@ export type {
 export type {
   AgentContextDocument,
   AgentDocumentBeforeSystemInjectorConfig,
+  AgentDocumentChange,
+  AgentDocumentChangesByMessage,
   AgentDocumentContextInjectorConfig,
+  AgentDocumentIndexSnapshot,
   AgentDocumentInjectionPosition,
   AgentDocumentLoadRule,
   AgentDocumentLoadRules,

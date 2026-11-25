@@ -13,8 +13,12 @@ import type {
 import type { OpenAIChatMessage, UIChatMessage } from '@/types/index';
 
 import type { AgentInfo } from '../../processors/GroupRoleTransform';
+import type { RevokedDocumentReads } from '../../processors/RevokedDocumentResultFilter';
 import type { AgentBuilderContext } from '../../providers/AgentBuilderContextInjector';
-import type { AgentContextDocument } from '../../providers/AgentDocumentInjector';
+import type {
+  AgentContextDocument,
+  AgentDocumentChangesByMessage,
+} from '../../providers/AgentDocumentInjector';
 import type { AgentManagementContext } from '../../providers/AgentManagementContextInjector';
 import type { BotPlatformContext } from '../../providers/BotPlatformContextInjector';
 import type { DiscordContext } from '../../providers/DiscordContextProvider';
@@ -62,6 +66,8 @@ export interface KnowledgeConfig {
  * Tools configuration
  */
 export interface ToolsConfig {
+  /** Prepare optional prompt edits for a transport that can declare tools mid-conversation. */
+  anchorActivatedTools?: boolean;
   /** Tool identifiers that must be removed from historical tool calls in this runtime scope */
   disabledToolIdentifiers?: string[];
   /** Tool manifests with systemRole and API definitions */
@@ -223,6 +229,7 @@ export interface PlanTodoConfig {
  * MessagesEngine main parameters
  */
 export interface MessagesEngineParams {
+  enableMcpAppContext?: boolean;
   // ========== Required parameters ==========
   /** Original message list */
   messages: UIChatMessage[];
@@ -298,6 +305,18 @@ export interface MessagesEngineParams {
   knowledge?: KnowledgeConfig;
   /** Agent document configuration for context injection */
   agentDocuments?: AgentContextDocument[];
+  /**
+   * Agent-document change notes keyed by the user message each belongs to.
+   * The host passes them when `agentDocuments` renders the index from a
+   * snapshot (see `resolveAgentDocumentIndex`).
+   */
+  agentDocumentChanges?: AgentDocumentChangesByMessage;
+  /**
+   * Documents deleted or disabled since earlier turns read them, per reading
+   * agent. Historical `readKnowledge` / `readDocument` results referencing
+   * them are withheld from the model.
+   */
+  revokedDocumentReads?: RevokedDocumentReads[];
 
   // ========== Skills ==========
   /** Skills configuration */
